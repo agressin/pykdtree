@@ -273,6 +273,191 @@ void voxel_downsample_float(float *points, uint64_t n,
 }
 
 /************************************************
+Voxelize with aggregation: compute voxel centroids and aggregate features.
+
+For each occupied voxel, computes:
+- centroid (mean x, y, z)
+- aggregated features (mean, max, or sum)
+- point-to-voxel inverse map
+
+Params:
+    points        : (n * 3) contiguous point coords
+    n             : number of points
+    voxel_size    : voxel edge length
+    features      : (n * n_feat) contiguous features, or NULL
+    n_feat        : number of feature columns (0 if no features)
+    method        : aggregation method (0=mean, 1=max, 2=sum)
+    centroids_out : output (n_unique * 3) voxel centroids
+    features_out  : output (n_unique * n_feat) aggregated features, or NULL
+    inverse_out   : (n,) maps each point to its voxel index
+    n_unique_out  : number of unique voxels (return)
+************************************************/
+void voxelize_float(float *points, uint64_t n,
+                        float voxel_size,
+                        float *features, uint64_t n_feat,
+                        int method,
+                        float *centroids_out,
+                        float *features_out,
+                        uint64_t *inverse_out,
+                        uint64_t *n_unique_out)
+{
+    int64_t i;
+    int64_t local_n = (int64_t)n;
+    uint64_t j;
+
+    if (n == 0) { *n_unique_out = 0; return; }
+
+    /* 1. Find bounding box minimum */
+    float min_x = DIST_MAX_float;
+    float min_y = DIST_MAX_float;
+    float min_z = DIST_MAX_float;
+
+    #pragma omp parallel for reduction(min:min_x,min_y,min_z) schedule(static)
+    for (i = 0; i < local_n; i++)
+    {
+        float px = points[3 * i], py = points[3 * i + 1], pz = points[3 * i + 2];
+        if (px < min_x) min_x = px;
+        if (py < min_y) min_y = py;
+        if (pz < min_z) min_z = pz;
+    }
+
+    /* 2. Quantize to voxel keys */
+    float inv_vs = 1 / voxel_size;
+    uint64_t *voxel_keys = (uint64_t *)malloc(n * sizeof(uint64_t));
+
+    #pragma omp parallel for schedule(static)
+    for (i = 0; i < local_n; i++)
+    {
+        uint64_t ix = (uint64_t)floor((points[3 * i]     - min_x) * inv_vs);
+        uint64_t iy = (uint64_t)floor((points[3 * i + 1] - min_y) * inv_vs);
+        uint64_t iz = (uint64_t)floor((points[3 * i + 2] - min_z) * inv_vs);
+        if (ix > 0x1FFFFFULL) ix = 0x1FFFFFULL;
+        if (iy > 0x1FFFFFULL) iy = 0x1FFFFFULL;
+        if (iz > 0x1FFFFFULL) iz = 0x1FFFFFULL;
+        voxel_keys[i] = ix | (iy << 21) | (iz << 42);
+    }
+
+    /* 3. Hash table: deduplicate + accumulate */
+    uint64_t table_size = 1;
+    while (table_size < 2 * n) table_size <<= 1;
+    uint64_t ht_mask = table_size - 1;
+
+    uint64_t *ht_keys = (uint64_t *)malloc(table_size * sizeof(uint64_t));
+    uint64_t *ht_vid  = (uint64_t *)malloc(table_size * sizeof(uint64_t));
+    memset(ht_keys, 0xFF, table_size * sizeof(uint64_t));
+
+    /* Accumulators for centroids */
+    uint64_t max_voxels = n;  /* upper bound */
+    float *sum_x = (float *)calloc(max_voxels, sizeof(float));
+    float *sum_y = (float *)calloc(max_voxels, sizeof(float));
+    float *sum_z = (float *)calloc(max_voxels, sizeof(float));
+    uint64_t *counts = (uint64_t *)calloc(max_voxels, sizeof(uint64_t));
+
+    /* Feature accumulators */
+    float *feat_acc = NULL;
+    if (features && n_feat > 0 && features_out)
+    {
+        feat_acc = (float *)calloc(max_voxels * n_feat, sizeof(float));
+        if (method == 1) /* max: init to -inf */
+        {
+            for (i = 0; i < (int64_t)(max_voxels * n_feat); i++)
+                feat_acc[i] = -DIST_MAX_float;
+        }
+    }
+
+    uint64_t n_unique = 0;
+    #define HT_EMPTY 0xFFFFFFFFFFFFFFFFULL
+
+    for (i = 0; i < local_n; i++)
+    {
+        uint64_t key = voxel_keys[i];
+        uint64_t h = key;
+        h ^= h >> 30;
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= h >> 27;
+        h *= 0x94D049BB133111EBULL;
+        h ^= h >> 31;
+        h &= ht_mask;
+
+        uint64_t vid;
+        while (1)
+        {
+            if (ht_keys[h] == HT_EMPTY)
+            {
+                ht_keys[h] = key;
+                vid = n_unique;
+                ht_vid[h] = vid;
+                n_unique++;
+                break;
+            }
+            else if (ht_keys[h] == key)
+            {
+                vid = ht_vid[h];
+                break;
+            }
+            h = (h + 1) & ht_mask;
+        }
+
+        inverse_out[i] = vid;
+
+        /* Accumulate centroid */
+        sum_x[vid] += points[3 * i];
+        sum_y[vid] += points[3 * i + 1];
+        sum_z[vid] += points[3 * i + 2];
+        counts[vid]++;
+
+        /* Accumulate features */
+        if (feat_acc)
+        {
+            for (j = 0; j < n_feat; j++)
+            {
+                float fval = features[i * n_feat + j];
+                if (method == 1) /* max */
+                {
+                    if (fval > feat_acc[vid * n_feat + j])
+                        feat_acc[vid * n_feat + j] = fval;
+                }
+                else /* mean or sum */
+                {
+                    feat_acc[vid * n_feat + j] += fval;
+                }
+            }
+        }
+    }
+    #undef HT_EMPTY
+
+    /* 4. Finalize: compute centroids and mean features */
+    #pragma omp parallel for schedule(static)
+    for (i = 0; i < (int64_t)n_unique; i++)
+    {
+        float inv_cnt = 1.0 / counts[i];
+        centroids_out[3 * i]     = sum_x[i] * inv_cnt;
+        centroids_out[3 * i + 1] = sum_y[i] * inv_cnt;
+        centroids_out[3 * i + 2] = sum_z[i] * inv_cnt;
+
+        if (feat_acc && method == 0) /* mean */
+        {
+            for (j = 0; j < n_feat; j++)
+                features_out[i * n_feat + j] = feat_acc[i * n_feat + j] * inv_cnt;
+        }
+        else if (feat_acc) /* max or sum: already final */
+        {
+            for (j = 0; j < n_feat; j++)
+                features_out[i * n_feat + j] = feat_acc[i * n_feat + j];
+        }
+    }
+
+    *n_unique_out = n_unique;
+
+    free(voxel_keys);
+    free(ht_keys);
+    free(ht_vid);
+    free(sum_x); free(sum_y); free(sum_z);
+    free(counts);
+    if (feat_acc) free(feat_acc);
+}
+
+/************************************************
 Assign each point to its tile based on floor division.
 
 Params:
@@ -656,6 +841,191 @@ void voxel_downsample_double(double *points, uint64_t n,
     free(ht_keys);
     free(ht_vid);
     free(voxel_keys);
+}
+
+/************************************************
+Voxelize with aggregation: compute voxel centroids and aggregate features.
+
+For each occupied voxel, computes:
+- centroid (mean x, y, z)
+- aggregated features (mean, max, or sum)
+- point-to-voxel inverse map
+
+Params:
+    points        : (n * 3) contiguous point coords
+    n             : number of points
+    voxel_size    : voxel edge length
+    features      : (n * n_feat) contiguous features, or NULL
+    n_feat        : number of feature columns (0 if no features)
+    method        : aggregation method (0=mean, 1=max, 2=sum)
+    centroids_out : output (n_unique * 3) voxel centroids
+    features_out  : output (n_unique * n_feat) aggregated features, or NULL
+    inverse_out   : (n,) maps each point to its voxel index
+    n_unique_out  : number of unique voxels (return)
+************************************************/
+void voxelize_double(double *points, uint64_t n,
+                        double voxel_size,
+                        double *features, uint64_t n_feat,
+                        int method,
+                        double *centroids_out,
+                        double *features_out,
+                        uint64_t *inverse_out,
+                        uint64_t *n_unique_out)
+{
+    int64_t i;
+    int64_t local_n = (int64_t)n;
+    uint64_t j;
+
+    if (n == 0) { *n_unique_out = 0; return; }
+
+    /* 1. Find bounding box minimum */
+    double min_x = DIST_MAX_double;
+    double min_y = DIST_MAX_double;
+    double min_z = DIST_MAX_double;
+
+    #pragma omp parallel for reduction(min:min_x,min_y,min_z) schedule(static)
+    for (i = 0; i < local_n; i++)
+    {
+        double px = points[3 * i], py = points[3 * i + 1], pz = points[3 * i + 2];
+        if (px < min_x) min_x = px;
+        if (py < min_y) min_y = py;
+        if (pz < min_z) min_z = pz;
+    }
+
+    /* 2. Quantize to voxel keys */
+    double inv_vs = 1 / voxel_size;
+    uint64_t *voxel_keys = (uint64_t *)malloc(n * sizeof(uint64_t));
+
+    #pragma omp parallel for schedule(static)
+    for (i = 0; i < local_n; i++)
+    {
+        uint64_t ix = (uint64_t)floor((points[3 * i]     - min_x) * inv_vs);
+        uint64_t iy = (uint64_t)floor((points[3 * i + 1] - min_y) * inv_vs);
+        uint64_t iz = (uint64_t)floor((points[3 * i + 2] - min_z) * inv_vs);
+        if (ix > 0x1FFFFFULL) ix = 0x1FFFFFULL;
+        if (iy > 0x1FFFFFULL) iy = 0x1FFFFFULL;
+        if (iz > 0x1FFFFFULL) iz = 0x1FFFFFULL;
+        voxel_keys[i] = ix | (iy << 21) | (iz << 42);
+    }
+
+    /* 3. Hash table: deduplicate + accumulate */
+    uint64_t table_size = 1;
+    while (table_size < 2 * n) table_size <<= 1;
+    uint64_t ht_mask = table_size - 1;
+
+    uint64_t *ht_keys = (uint64_t *)malloc(table_size * sizeof(uint64_t));
+    uint64_t *ht_vid  = (uint64_t *)malloc(table_size * sizeof(uint64_t));
+    memset(ht_keys, 0xFF, table_size * sizeof(uint64_t));
+
+    /* Accumulators for centroids */
+    uint64_t max_voxels = n;  /* upper bound */
+    double *sum_x = (double *)calloc(max_voxels, sizeof(double));
+    double *sum_y = (double *)calloc(max_voxels, sizeof(double));
+    double *sum_z = (double *)calloc(max_voxels, sizeof(double));
+    uint64_t *counts = (uint64_t *)calloc(max_voxels, sizeof(uint64_t));
+
+    /* Feature accumulators */
+    double *feat_acc = NULL;
+    if (features && n_feat > 0 && features_out)
+    {
+        feat_acc = (double *)calloc(max_voxels * n_feat, sizeof(double));
+        if (method == 1) /* max: init to -inf */
+        {
+            for (i = 0; i < (int64_t)(max_voxels * n_feat); i++)
+                feat_acc[i] = -DIST_MAX_double;
+        }
+    }
+
+    uint64_t n_unique = 0;
+    #define HT_EMPTY 0xFFFFFFFFFFFFFFFFULL
+
+    for (i = 0; i < local_n; i++)
+    {
+        uint64_t key = voxel_keys[i];
+        uint64_t h = key;
+        h ^= h >> 30;
+        h *= 0xBF58476D1CE4E5B9ULL;
+        h ^= h >> 27;
+        h *= 0x94D049BB133111EBULL;
+        h ^= h >> 31;
+        h &= ht_mask;
+
+        uint64_t vid;
+        while (1)
+        {
+            if (ht_keys[h] == HT_EMPTY)
+            {
+                ht_keys[h] = key;
+                vid = n_unique;
+                ht_vid[h] = vid;
+                n_unique++;
+                break;
+            }
+            else if (ht_keys[h] == key)
+            {
+                vid = ht_vid[h];
+                break;
+            }
+            h = (h + 1) & ht_mask;
+        }
+
+        inverse_out[i] = vid;
+
+        /* Accumulate centroid */
+        sum_x[vid] += points[3 * i];
+        sum_y[vid] += points[3 * i + 1];
+        sum_z[vid] += points[3 * i + 2];
+        counts[vid]++;
+
+        /* Accumulate features */
+        if (feat_acc)
+        {
+            for (j = 0; j < n_feat; j++)
+            {
+                double fval = features[i * n_feat + j];
+                if (method == 1) /* max */
+                {
+                    if (fval > feat_acc[vid * n_feat + j])
+                        feat_acc[vid * n_feat + j] = fval;
+                }
+                else /* mean or sum */
+                {
+                    feat_acc[vid * n_feat + j] += fval;
+                }
+            }
+        }
+    }
+    #undef HT_EMPTY
+
+    /* 4. Finalize: compute centroids and mean features */
+    #pragma omp parallel for schedule(static)
+    for (i = 0; i < (int64_t)n_unique; i++)
+    {
+        double inv_cnt = 1.0 / counts[i];
+        centroids_out[3 * i]     = sum_x[i] * inv_cnt;
+        centroids_out[3 * i + 1] = sum_y[i] * inv_cnt;
+        centroids_out[3 * i + 2] = sum_z[i] * inv_cnt;
+
+        if (feat_acc && method == 0) /* mean */
+        {
+            for (j = 0; j < n_feat; j++)
+                features_out[i * n_feat + j] = feat_acc[i * n_feat + j] * inv_cnt;
+        }
+        else if (feat_acc) /* max or sum: already final */
+        {
+            for (j = 0; j < n_feat; j++)
+                features_out[i * n_feat + j] = feat_acc[i * n_feat + j];
+        }
+    }
+
+    *n_unique_out = n_unique;
+
+    free(voxel_keys);
+    free(ht_keys);
+    free(ht_vid);
+    free(sum_x); free(sum_y); free(sum_z);
+    free(counts);
+    if (feat_acc) free(feat_acc);
 }
 
 /************************************************

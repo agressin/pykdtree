@@ -202,12 +202,12 @@ def bench_merge_tiles(n_tiles, pts_per_tile):
     roi = (200.0, 200.0, (n_tiles - 1) * 1000 + 800.0, 800.0)
 
     # --- pykdtree C (separate columns) ---
-    (xyz_c, masks_c), dt_c = timer("pykdtree merge_tiles (x,y,z cols)",
-                                    merge_tiles, tiles_cols, offsets, roi)
+    (xyz_c, _, masks_c), dt_c = timer("pykdtree merge_tiles (x,y,z cols)",
+                                       merge_tiles, tiles_cols, offsets, roi)
 
     # --- pykdtree C (stacked arrays, backwards compat) ---
-    (xyz_c2, _), dt_c2 = timer("pykdtree merge_tiles (n,3 arrays)",
-                                merge_tiles, tiles_stacked, offsets, roi)
+    (xyz_c2, _, _), dt_c2 = timer("pykdtree merge_tiles (n,3 arrays)",
+                                    merge_tiles, tiles_stacked, offsets, roi)
 
     # --- numpy reference (what projax does) ---
     def np_merge(tile_list, offs, roi_bounds):
@@ -246,7 +246,7 @@ def bench_merge_tiles(n_tiles, pts_per_tile):
         })
 
     # Get masks from the C call above
-    _, masks_for_attrs = merge_tiles(tiles_cols, offsets, roi)
+    _, _, masks_for_attrs = merge_tiles(tiles_cols, offsets, roi)
 
     # --- pykdtree apply_masks ---
     def c_apply_all(t_attrs, m):
@@ -269,6 +269,59 @@ def bench_merge_tiles(n_tiles, pts_per_tile):
     for key in attr_names:
         assert np.array_equal(attrs_c[key], attrs_np[key]), f"Attr {key} mismatch!"
     print(f"  Attr speedup: {dt_np_attr/dt_c_attr:.1f}x")
+
+    # --- merge_tiles with integrated attributes ---
+    tile_attr_dict = {
+        "intensity": [tile_attrs[i]["intensity"] for i in range(n_tiles)],
+        "classification": [tile_attrs[i]["classification"] for i in range(n_tiles)],
+        "gps_time": [tile_attrs[i]["gps_time"] for i in range(n_tiles)],
+    }
+
+    (xyz_all, attrs_all, _), dt_all = timer(
+        "pykdtree merge_tiles+attrs (all-in-one)",
+        merge_tiles, tiles_cols, offsets, roi, tile_attr_dict)
+    print(f"  All-in-one speedup vs numpy: {(dt_np + dt_np_attr)/dt_all:.1f}x")
+
+
+def bench_voxelize(n):
+    print(f"\n=== Voxelize with aggregation  (N={n:,}) ===")
+    from pykdtree.spatial import voxelize
+
+    points = np.random.rand(n, 3).astype(np.float32) * 100
+    features = np.random.rand(n, 3).astype(np.float32)  # e.g. RGB
+    voxel_size = 0.5
+
+    # --- pykdtree C (mean) ---
+    (cent_c, feat_c, inv_c), dt_c = timer("pykdtree.spatial.voxelize (mean)",
+                                           voxelize, points, voxel_size, features, 'mean')
+
+    # --- numpy reference ---
+    def np_voxelize(pts, feats, vs):
+        voxel_coords = np.floor(pts / vs).astype(np.int64)
+        _, idx, inv = np.unique(voxel_coords, axis=0, return_index=True, return_inverse=True)
+        n_vox = len(idx)
+        centroids = np.zeros((n_vox, 3), dtype=np.float32)
+        agg_feats = np.zeros((n_vox, feats.shape[1]), dtype=np.float32)
+        counts = np.zeros(n_vox, dtype=np.int64)
+        np.add.at(centroids, inv, pts)
+        np.add.at(agg_feats, inv, feats)
+        np.add.at(counts, inv, 1)
+        centroids /= counts[:, None]
+        agg_feats /= counts[:, None]
+        return centroids, agg_feats, inv
+
+    (cent_np, feat_np, inv_np), dt_np = timer("numpy unique+add.at", np_voxelize, points, features, voxel_size)
+
+    print(f"  Voxels (C): {cent_c.shape[0]:,}  (numpy): {cent_np.shape[0]:,}")
+    print(f"  Speedup: {dt_np/dt_c:.1f}x")
+
+    # --- max method ---
+    (_, feat_max, _), dt_max = timer("pykdtree.spatial.voxelize (max)",
+                                      voxelize, points, voxel_size, features, 'max')
+
+    # --- no features (centroids only) ---
+    (cent_only, _, _), dt_nf = timer("pykdtree.spatial.voxelize (no features)",
+                                      voxelize, points, voxel_size)
 
 
 def bench_kdtree_new_methods(n):
@@ -301,6 +354,7 @@ if __name__ == "__main__":
     bench_filter_bbox(N)
     bench_merge_tiles(20, 100_000)   # 20 tiles × 100K = 2M points
     bench_merge_tiles(100, 100_000)  # 100 tiles × 100K = 10M points
+    bench_voxelize(N)
     bench_kdtree_new_methods(N)
 
     print(f"\n{'='*60}")

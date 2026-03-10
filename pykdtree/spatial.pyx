@@ -45,6 +45,15 @@ cdef extern void voxel_downsample_double(double *points, uint64_t n, double voxe
                                          uint64_t *selected_out, uint64_t *inverse_out,
                                          uint64_t *n_unique_out) nogil
 
+cdef extern void voxelize_float(float *points, uint64_t n, float voxel_size,
+                                 float *features, uint64_t n_feat, int method,
+                                 float *centroids_out, float *features_out,
+                                 uint64_t *inverse_out, uint64_t *n_unique_out) nogil
+cdef extern void voxelize_double(double *points, uint64_t n, double voxel_size,
+                                  double *features, uint64_t n_feat, int method,
+                                  double *centroids_out, double *features_out,
+                                  uint64_t *inverse_out, uint64_t *n_unique_out) nogil
+
 cdef extern void assign_tiles_float(float *points, uint64_t n, float tile_size,
                                     int32_t *tile_x_out, int32_t *tile_y_out) nogil
 cdef extern void assign_tiles_double(double *points, uint64_t n, double tile_size,
@@ -461,7 +470,7 @@ def filter_bbox(np.ndarray points not None,
 
 
 def merge_tiles(list tiles not None, np.ndarray offsets not None,
-                roi=None):
+                roi=None, dict attributes=None):
     """Merge multiple point cloud tiles with ROI filtering and coordinate transform.
 
     Fuses ROI masking, coordinate transformation, and concatenation into a
@@ -479,13 +488,18 @@ def merge_tiles(list tiles not None, np.ndarray offsets not None,
     roi : tuple (min_x, min_y, max_x, max_y) or None
         ROI bounds in target (scene-local) coordinates.
         If None, all points are included.
+    attributes : dict of {name: list of arrays} or None
+        Per-tile attribute columns. Each key maps to a list of N arrays
+        (one per tile). Masks are applied and arrays concatenated automatically.
+        Example: ``{"intensity": [i0, i1, ...], "class": [c0, c1, ...]}``
 
     :Returns:
     xyz : numpy array, shape (n_total, 3)
         Merged and transformed point coordinates (interleaved).
+    attrs : dict of {name: array} or None
+        Merged attribute arrays (only if ``attributes`` was provided).
     masks : list of numpy bool arrays
         Per-tile masks indicating which points survived ROI filtering.
-        Useful for extracting attributes on the Python side.
     """
     cdef uint64_t n_tiles = <uint64_t>len(tiles)
     if n_tiles == 0:
@@ -624,7 +638,15 @@ def merge_tiles(list tiles not None, np.ndarray offsets not None,
 
     # Convert masks to bool views
     result_masks = [mask_list[t][:sizes[t]].view(np.bool_) for t in range(n_tiles)]
-    return result_xyz, result_masks
+
+    # Apply masks to attributes if provided
+    result_attrs = None
+    if attributes is not None:
+        result_attrs = {}
+        for attr_name, attr_arrays in attributes.items():
+            result_attrs[attr_name] = apply_masks(list(attr_arrays), result_masks)
+
+    return result_xyz, result_attrs, result_masks
 
 
 def apply_masks(list arrays not None, list masks not None):
@@ -699,3 +721,111 @@ def apply_masks(list arrays not None, list masks not None):
     free(mask_ptrs_c)
 
     return out[:total_out]
+
+
+def voxelize(np.ndarray points not None, voxel_size,
+             np.ndarray features=None, str method='mean'):
+    """Voxelize a point cloud with aggregation.
+
+    For each occupied voxel, computes the centroid (mean position) and
+    optionally aggregates feature columns using mean, max, or sum.
+
+    :Parameters:
+    points : numpy array, shape (n, 3)
+        Point coordinates (float32 or float64).
+    voxel_size : float
+        Voxel edge length.
+    features : numpy array, shape (n, n_feat), optional
+        Feature columns to aggregate. Same dtype as points.
+    method : str, optional
+        Aggregation method: ``'mean'``, ``'max'``, or ``'sum'`` (default ``'mean'``).
+
+    :Returns:
+    centroids : numpy array, shape (n_unique, 3)
+        Voxel centroids (mean of all points in each voxel).
+    agg_features : numpy array, shape (n_unique, n_feat) or None
+        Aggregated features per voxel (None if no features provided).
+    inverse : numpy uint64 array, shape (n,)
+        Maps each input point to its voxel index.
+    """
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError('points must have shape (n, 3)')
+    if voxel_size <= 0:
+        raise ValueError('voxel_size must be positive')
+
+    cdef int c_method = 0
+    if method == 'max':
+        c_method = 1
+    elif method == 'sum':
+        c_method = 2
+    elif method != 'mean':
+        raise ValueError("method must be 'mean', 'max', or 'sum'")
+
+    cdef uint64_t n = <uint64_t>points.shape[0]
+    cdef uint64_t n_feat = 0
+    cdef float c_vs_f = <float>voxel_size
+    cdef double c_vs_d = <double>voxel_size
+    cdef uint64_t n_unique = 0
+
+    cdef np.ndarray[uint64_t, ndim=1] inverse = np.empty(n, dtype=np.uint64)
+    cdef np.ndarray[float, ndim=1] centroids_f, features_f, feat_out_f
+    cdef np.ndarray[double, ndim=1] centroids_d, features_d, feat_out_d
+    cdef np.ndarray[float, ndim=1] pts_flat_f
+    cdef np.ndarray[double, ndim=1] pts_flat_d
+    cdef float *feat_ptr_f = NULL
+    cdef float *feat_out_ptr_f = NULL
+    cdef double *feat_ptr_d = NULL
+    cdef double *feat_out_ptr_d = NULL
+
+    if features is not None:
+        if features.ndim == 1:
+            n_feat = 1
+        elif features.ndim == 2:
+            n_feat = <uint64_t>features.shape[1]
+        else:
+            raise ValueError('features must be 1D or 2D')
+
+    if points.dtype == np.float32:
+        pts_flat_f = np.ascontiguousarray(points.ravel(), dtype=np.float32)
+        centroids_f = np.empty(n * 3, dtype=np.float32)
+
+        if n_feat > 0:
+            features_f = np.ascontiguousarray(features.ravel(), dtype=np.float32)
+            feat_out_f = np.empty(n * n_feat, dtype=np.float32)
+            feat_ptr_f = <float *>features_f.data
+            feat_out_ptr_f = <float *>feat_out_f.data
+
+        with nogil:
+            voxelize_float(<float *>pts_flat_f.data, n, c_vs_f,
+                           feat_ptr_f, n_feat, c_method,
+                           <float *>centroids_f.data, feat_out_ptr_f,
+                           <uint64_t *>inverse.data, &n_unique)
+
+        result_centroids = centroids_f[:n_unique * 3].reshape(n_unique, 3)
+        if n_feat > 0:
+            result_features = feat_out_f[:n_unique * n_feat].reshape(n_unique, n_feat)
+        else:
+            result_features = None
+    else:
+        pts_flat_d = np.ascontiguousarray(points.ravel(), dtype=np.float64)
+        centroids_d = np.empty(n * 3, dtype=np.float64)
+
+        if n_feat > 0:
+            features_d = np.ascontiguousarray(features.ravel(), dtype=np.float64)
+            feat_out_d = np.empty(n * n_feat, dtype=np.float64)
+            feat_ptr_d = <double *>features_d.data
+            feat_out_ptr_d = <double *>feat_out_d.data
+
+        with nogil:
+            voxelize_double(<double *>pts_flat_d.data, n, c_vs_d,
+                            feat_ptr_d, n_feat, c_method,
+                            <double *>centroids_d.data, feat_out_ptr_d,
+                            <uint64_t *>inverse.data, &n_unique)
+
+        result_centroids = centroids_d[:n_unique * 3].reshape(n_unique, 3)
+        if n_feat > 0:
+            result_features = feat_out_d[:n_unique * n_feat].reshape(n_unique, n_feat)
+        else:
+            result_features = None
+
+    return result_centroids, result_features, inverse
