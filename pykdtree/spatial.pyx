@@ -110,6 +110,74 @@ cdef extern void merge_tiles_double(double **tile_x_ptrs, double **tile_y_ptrs,
                                      double *xyz_out, uint8_t **mask_ptrs,
                                      uint64_t *tile_counts_out, uint64_t *total_out) nogil
 
+cdef extern void compute_overlap_weights_float(float *points_xy, uint64_t n,
+                                                float roi_cx, float roi_cy,
+                                                float roi_half_sx, float roi_half_sy,
+                                                float center_ratio,
+                                                float *weights_out) nogil
+cdef extern void compute_overlap_weights_double(double *points_xy, uint64_t n,
+                                                 double roi_cx, double roi_cy,
+                                                 double roi_half_sx, double roi_half_sy,
+                                                 double center_ratio,
+                                                 double *weights_out) nogil
+
+cdef extern void accumulate_predictions_float(uint64_t *row_ids, float *weights,
+                                               uint64_t m, int strategy,
+                                               uint64_t n_classes,
+                                               int32_t *preds_int,
+                                               float *preds_float,
+                                               int32_t *acc_preds_int,
+                                               float *acc_weights,
+                                               float *acc_sum,
+                                               float *acc_votes,
+                                               uint8_t *acc_has_pred) nogil
+cdef extern void accumulate_predictions_double(uint64_t *row_ids, double *weights,
+                                                uint64_t m, int strategy,
+                                                uint64_t n_classes,
+                                                int32_t *preds_int,
+                                                double *preds_float,
+                                                int32_t *acc_preds_int,
+                                                double *acc_weights,
+                                                double *acc_sum,
+                                                double *acc_votes,
+                                                uint8_t *acc_has_pred) nogil
+
+cdef extern void finalize_predictions_float(uint64_t n_points, int strategy,
+                                             uint64_t n_classes, int is_probas,
+                                             float default_value,
+                                             int32_t *acc_preds_int,
+                                             float *acc_weights,
+                                             float *acc_sum,
+                                             float *result_float,
+                                             float *acc_votes,
+                                             uint8_t *acc_has_pred) nogil
+cdef extern void finalize_predictions_double(uint64_t n_points, int strategy,
+                                              uint64_t n_classes, int is_probas,
+                                              double default_value,
+                                              int32_t *acc_preds_int,
+                                              double *acc_weights,
+                                              double *acc_sum,
+                                              double *result_float,
+                                              double *acc_votes,
+                                              uint8_t *acc_has_pred) nogil
+
+cdef extern void unbuffer_and_scatter_float(float *points_xy, uint64_t n,
+                                             float core_min_x, float core_min_y,
+                                             float core_max_x, float core_max_y,
+                                             uint64_t *row_indices,
+                                             float *src_values, uint64_t n_cols,
+                                             float *dst_values,
+                                             uint8_t *core_mask_out,
+                                             uint64_t *n_core_out) nogil
+cdef extern void unbuffer_and_scatter_double(double *points_xy, uint64_t n,
+                                              double core_min_x, double core_min_y,
+                                              double core_max_x, double core_max_y,
+                                              uint64_t *row_indices,
+                                              double *src_values, uint64_t n_cols,
+                                              double *dst_values,
+                                              uint8_t *core_mask_out,
+                                              uint64_t *n_core_out) nogil
+
 
 # ---- Python API ----
 
@@ -829,3 +897,335 @@ def voxelize(np.ndarray points not None, voxel_size,
             result_features = None
 
     return result_centroids, result_features, inverse
+
+
+def compute_overlap_weights(np.ndarray points_xy not None,
+                            roi_center, roi_half_size,
+                            float center_ratio=0.6):
+    """Compute overlap weights by distance to ROI center.
+
+    Points in the center zone get weight 1.0. Weight decreases
+    linearly to 0.0 at the ROI edge.
+
+    :Parameters:
+    points_xy : numpy array, shape (n, 2)
+        Point XY coordinates.
+    roi_center : tuple (cx, cy)
+        ROI center coordinates.
+    roi_half_size : tuple (half_sx, half_sy)
+        ROI half-sizes (width/2, height/2).
+    center_ratio : float, optional
+        Fraction of ROI considered center zone (default 0.6).
+
+    :Returns:
+    weights : numpy float32 array, shape (n,)
+        Overlap weights in [0, 1].
+    """
+    if points_xy.ndim != 2 or points_xy.shape[1] != 2:
+        raise ValueError('points_xy must have shape (n, 2)')
+
+    cdef uint64_t n = <uint64_t>points_xy.shape[0]
+    cdef float c_cx_f = <float>roi_center[0], c_cy_f = <float>roi_center[1]
+    cdef float c_hsx_f = <float>roi_half_size[0], c_hsy_f = <float>roi_half_size[1]
+    cdef double c_cx_d = <double>roi_center[0], c_cy_d = <double>roi_center[1]
+    cdef double c_hsx_d = <double>roi_half_size[0], c_hsy_d = <double>roi_half_size[1]
+    cdef float c_cr = <float>center_ratio
+    cdef np.ndarray[float, ndim=1] xy_f
+    cdef np.ndarray[double, ndim=1] xy_d
+    cdef np.ndarray[float, ndim=1] weights_f
+    cdef np.ndarray[double, ndim=1] weights_d
+
+    if points_xy.dtype == np.float32:
+        xy_f = np.ascontiguousarray(points_xy.ravel(), dtype=np.float32)
+        weights_f = np.empty(n, dtype=np.float32)
+        with nogil:
+            compute_overlap_weights_float(
+                <float *>xy_f.data, n,
+                c_cx_f, c_cy_f, c_hsx_f, c_hsy_f,
+                c_cr, <float *>weights_f.data)
+        return weights_f
+    else:
+        xy_d = np.ascontiguousarray(points_xy.ravel(), dtype=np.float64)
+        weights_d = np.empty(n, dtype=np.float64)
+        with nogil:
+            compute_overlap_weights_double(
+                <double *>xy_d.data, n,
+                c_cx_d, c_cy_d, c_hsx_d, c_hsy_d,
+                <double>center_ratio, <double *>weights_d.data)
+        return weights_d.astype(np.float32)
+
+
+class PredictionAccumulator:
+    """Accumulates predictions per point with overlap handling.
+
+    C/OpenMP-accelerated replacement for projax's PredictionAccumulator.
+
+    Strategies:
+        - ``"center"``: Keep prediction with highest weight
+        - ``"mean"``: Weighted average of logits/probas
+        - ``"vote"``: Weighted majority vote per class
+
+    :Parameters:
+    n_points : int
+        Total number of points.
+    output_type : str
+        ``"classes"``, ``"logits"``, or ``"probas"``.
+    n_classes : int or None
+        Number of classes (required for mean/vote).
+    strategy : str
+        ``"center"``, ``"mean"``, or ``"vote"``.
+    default_value : float
+        Fill value for points with no predictions.
+    """
+
+    def __init__(self, int n_points, str output_type='classes',
+                 n_classes=None, str strategy='center',
+                 default_value=-1):
+        self.n_points = n_points
+        self.output_type = output_type
+        self.n_classes = n_classes if n_classes is not None else 0
+        self.strategy = strategy
+        self.default_value = default_value
+
+        cdef int strat_id = 0
+        if strategy == 'mean':
+            strat_id = 1
+        elif strategy == 'vote':
+            strat_id = 2
+        self._strategy_id = strat_id
+
+        # Allocate accumulators
+        if output_type == 'classes':
+            if strategy == 'center':
+                self._acc_preds = np.full(n_points, default_value, dtype=np.int32)
+                self._acc_weights = np.zeros(n_points, dtype=np.float32)
+            else:  # vote
+                if n_classes is None or n_classes <= 0:
+                    raise ValueError('n_classes required for vote strategy')
+                self._acc_votes = np.zeros((n_points, self.n_classes), dtype=np.float32)
+                self._acc_has_pred = np.zeros(n_points, dtype=np.uint8)
+                self._acc_preds = np.full(n_points, default_value, dtype=np.int32)
+        else:  # logits/probas
+            if n_classes is None or n_classes <= 0:
+                raise ValueError(f'n_classes required for {output_type}')
+            self._acc_sum = np.zeros((n_points, self.n_classes), dtype=np.float32)
+            self._acc_weights = np.zeros(n_points, dtype=np.float32)
+
+    def add(self, np.ndarray row_ids not None,
+            np.ndarray predictions not None,
+            np.ndarray weights not None):
+        """Add predictions for a set of points.
+
+        :Parameters:
+        row_ids : numpy uint64 array, shape (m,)
+            Point indices.
+        predictions : numpy array
+            (m,) int32 for classes, or (m, n_classes) float32 for logits/probas.
+        weights : numpy float32 array, shape (m,)
+            Overlap weights.
+        """
+        cdef uint64_t m = <uint64_t>len(row_ids)
+        if m == 0:
+            return
+
+        cdef np.ndarray[uint64_t, ndim=1] rids = np.ascontiguousarray(row_ids, dtype=np.uint64)
+        cdef np.ndarray[float, ndim=1] w = np.ascontiguousarray(weights, dtype=np.float32)
+
+        cdef np.ndarray[int32_t, ndim=1] preds_i
+        cdef np.ndarray[float, ndim=1] preds_f
+        cdef int32_t *preds_int_ptr = NULL
+        cdef float *preds_float_ptr = NULL
+
+        cdef np.ndarray[int32_t, ndim=1] acc_preds_arr
+        cdef np.ndarray[float, ndim=1] acc_weights_arr
+        cdef np.ndarray[float, ndim=1] acc_sum_arr
+        cdef np.ndarray[float, ndim=1] acc_votes_arr
+        cdef np.ndarray[uint8_t, ndim=1] acc_has_arr
+
+        cdef int32_t *acc_preds_ptr = NULL
+        cdef float *acc_w_ptr = NULL
+        cdef float *acc_sum_ptr = NULL
+        cdef float *acc_votes_ptr = NULL
+        cdef uint8_t *acc_has_ptr = NULL
+
+        cdef int strat = self._strategy_id
+        cdef uint64_t nc = <uint64_t>self.n_classes
+
+        if strat == 0:  # center
+            preds_i = np.ascontiguousarray(predictions, dtype=np.int32)
+            preds_int_ptr = <int32_t *>preds_i.data
+            acc_preds_arr = self._acc_preds
+            acc_preds_ptr = <int32_t *>acc_preds_arr.data
+            acc_weights_arr = self._acc_weights.ravel()
+            acc_w_ptr = <float *>acc_weights_arr.data
+        elif strat == 1:  # mean
+            preds_f = np.ascontiguousarray(predictions.ravel(), dtype=np.float32)
+            preds_float_ptr = <float *>preds_f.data
+            acc_weights_arr = self._acc_weights.ravel()
+            acc_w_ptr = <float *>acc_weights_arr.data
+            acc_sum_arr = self._acc_sum.ravel()
+            acc_sum_ptr = <float *>acc_sum_arr.data
+        else:  # vote
+            preds_i = np.ascontiguousarray(predictions, dtype=np.int32)
+            preds_int_ptr = <int32_t *>preds_i.data
+            acc_votes_arr = self._acc_votes.ravel()
+            acc_votes_ptr = <float *>acc_votes_arr.data
+            acc_has_arr = self._acc_has_pred
+            acc_has_ptr = <uint8_t *>acc_has_arr.data
+
+        with nogil:
+            accumulate_predictions_float(
+                <uint64_t *>rids.data, <float *>w.data, m,
+                strat, nc,
+                preds_int_ptr, preds_float_ptr,
+                acc_preds_ptr, acc_w_ptr,
+                acc_sum_ptr, acc_votes_ptr, acc_has_ptr)
+
+    def aggregate(self):
+        """Finalize and return predictions.
+
+        :Returns:
+        predictions : numpy array
+            (n_points,) int32 for classes, or (n_points, n_classes) float32.
+        """
+        cdef int strat = self._strategy_id
+        cdef uint64_t np_ = <uint64_t>self.n_points
+        cdef uint64_t nc = <uint64_t>self.n_classes
+        cdef int is_probas = 1 if self.output_type == 'probas' else 0
+        cdef float c_default = <float>self.default_value
+
+        cdef np.ndarray[int32_t, ndim=1] acc_preds_arr
+        cdef np.ndarray[float, ndim=1] acc_weights_arr
+        cdef np.ndarray[float, ndim=1] acc_sum_arr
+        cdef np.ndarray[float, ndim=1] result_f
+        cdef np.ndarray[float, ndim=1] acc_votes_arr
+        cdef np.ndarray[uint8_t, ndim=1] acc_has_arr
+
+        cdef int32_t *acc_preds_ptr = NULL
+        cdef float *acc_w_ptr = NULL
+        cdef float *acc_sum_ptr = NULL
+        cdef float *result_ptr = NULL
+        cdef float *acc_votes_ptr = NULL
+        cdef uint8_t *acc_has_ptr = NULL
+
+        if strat == 0:  # center — already done
+            return self._acc_preds.copy()
+        elif strat == 1:  # mean
+            result_f = np.empty(np_ * nc, dtype=np.float32)
+            result_ptr = <float *>result_f.data
+            acc_weights_arr = self._acc_weights.ravel()
+            acc_w_ptr = <float *>acc_weights_arr.data
+            acc_sum_arr = self._acc_sum.ravel()
+            acc_sum_ptr = <float *>acc_sum_arr.data
+
+            with nogil:
+                finalize_predictions_float(
+                    np_, strat, nc, is_probas,
+                    c_default,
+                    NULL, acc_w_ptr, acc_sum_ptr,
+                    result_ptr, NULL, NULL)
+            return result_f.reshape(self.n_points, self.n_classes)
+        else:  # vote
+            acc_preds_arr = self._acc_preds
+            acc_preds_ptr = <int32_t *>acc_preds_arr.data
+            acc_votes_arr = self._acc_votes.ravel()
+            acc_votes_ptr = <float *>acc_votes_arr.data
+            acc_has_arr = self._acc_has_pred
+            acc_has_ptr = <uint8_t *>acc_has_arr.data
+
+            with nogil:
+                finalize_predictions_float(
+                    np_, strat, nc, 0,
+                    c_default,
+                    acc_preds_ptr, NULL, NULL,
+                    NULL, acc_votes_ptr, acc_has_ptr)
+            return self._acc_preds.copy()
+
+
+def unbuffer_and_scatter(np.ndarray points_xy not None,
+                         core_bbox,
+                         np.ndarray row_indices=None,
+                         np.ndarray src_values=None,
+                         np.ndarray dst_values=None):
+    """Filter points to core bbox and scatter results by original index.
+
+    Fuses core mask computation (2D XY bbox) and attribute scatter-by-index
+    into a single C/OpenMP call.
+
+    :Parameters:
+    points_xy : numpy array, shape (n, 2)
+        Point XY coordinates (buffer + core region).
+    core_bbox : tuple (min_x, min_y, max_x, max_y)
+        Core bounding box (exclusive upper bounds).
+    row_indices : numpy uint64 array, shape (n,), optional
+        Original row indices for scatter. If None, only mask is computed.
+    src_values : numpy array, shape (n,) or (n, k), optional
+        Values to scatter from source positions.
+    dst_values : numpy array, shape (n_dst,) or (n_dst, k), optional
+        Pre-allocated destination for scattered values.
+
+    :Returns:
+    core_mask : numpy bool array, shape (n,)
+        True for points inside core bbox.
+    n_core : int
+        Number of points in core region.
+    """
+    if points_xy.ndim != 2 or points_xy.shape[1] != 2:
+        raise ValueError('points_xy must have shape (n, 2)')
+
+    cdef uint64_t n = <uint64_t>points_xy.shape[0]
+    cdef np.ndarray[uint8_t, ndim=1] core_mask = np.empty(n, dtype=np.uint8)
+    cdef uint64_t n_core = 0
+
+    cdef float c_min_x_f = <float>core_bbox[0], c_min_y_f = <float>core_bbox[1]
+    cdef float c_max_x_f = <float>core_bbox[2], c_max_y_f = <float>core_bbox[3]
+    cdef double c_min_x_d = <double>core_bbox[0], c_min_y_d = <double>core_bbox[1]
+    cdef double c_max_x_d = <double>core_bbox[2], c_max_y_d = <double>core_bbox[3]
+
+    cdef uint64_t n_cols = 0
+    cdef np.ndarray[uint64_t, ndim=1] ridx
+    cdef uint64_t *ridx_ptr = NULL
+    cdef float *src_ptr_f = NULL
+    cdef float *dst_ptr_f = NULL
+    cdef double *src_ptr_d = NULL
+    cdef double *dst_ptr_d = NULL
+
+    cdef np.ndarray[float, ndim=1] xy_f, src_f, dst_f
+    cdef np.ndarray[double, ndim=1] xy_d, src_d, dst_d
+
+    if row_indices is not None and src_values is not None and dst_values is not None:
+        ridx = np.ascontiguousarray(row_indices, dtype=np.uint64)
+        ridx_ptr = <uint64_t *>ridx.data
+        if src_values.ndim == 1:
+            n_cols = 1
+        else:
+            n_cols = <uint64_t>src_values.shape[1]
+
+    if points_xy.dtype == np.float32:
+        xy_f = np.ascontiguousarray(points_xy.ravel(), dtype=np.float32)
+        if ridx_ptr != NULL:
+            src_f = np.ascontiguousarray(src_values.ravel(), dtype=np.float32)
+            src_ptr_f = <float *>src_f.data
+            dst_f = dst_values.ravel()
+            dst_ptr_f = <float *>dst_f.data
+        with nogil:
+            unbuffer_and_scatter_float(
+                <float *>xy_f.data, n,
+                c_min_x_f, c_min_y_f, c_max_x_f, c_max_y_f,
+                ridx_ptr, src_ptr_f, n_cols, dst_ptr_f,
+                <uint8_t *>core_mask.data, &n_core)
+    else:
+        xy_d = np.ascontiguousarray(points_xy.ravel(), dtype=np.float64)
+        if ridx_ptr != NULL:
+            src_d = np.ascontiguousarray(src_values.ravel(), dtype=np.float64)
+            src_ptr_d = <double *>src_d.data
+            dst_d = dst_values.ravel()
+            dst_ptr_d = <double *>dst_d.data
+        with nogil:
+            unbuffer_and_scatter_double(
+                <double *>xy_d.data, n,
+                c_min_x_d, c_min_y_d, c_max_x_d, c_max_y_d,
+                ridx_ptr, src_ptr_d, n_cols, dst_ptr_d,
+                <uint8_t *>core_mask.data, &n_core)
+
+    return core_mask.view(np.bool_), int(n_core)

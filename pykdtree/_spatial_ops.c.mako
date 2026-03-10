@@ -729,6 +729,289 @@ void merge_tiles_${DTYPE}(${DTYPE} **tile_x_ptrs, ${DTYPE} **tile_y_ptrs,
     free(write_offsets);
 }
 
+/************************************************
+Compute overlap weights by distance to ROI center.
+
+Points in the center zone (d <= center_ratio) get weight 1.0.
+Weight decreases linearly to 0.0 at ROI edge (d = 1.0).
+
+Params:
+    points_xy     : (n * 2) contiguous XY coords
+    n             : number of points
+    roi_cx/cy     : ROI center
+    roi_half_sx/sy: ROI half-sizes
+    center_ratio  : fraction of ROI considered "center" (0-1)
+    weights_out   : (n,) output weights in [0, 1]
+************************************************/
+void compute_overlap_weights_${DTYPE}(${DTYPE} *points_xy, uint64_t n,
+                                       ${DTYPE} roi_cx, ${DTYPE} roi_cy,
+                                       ${DTYPE} roi_half_sx, ${DTYPE} roi_half_sy,
+                                       ${DTYPE} center_ratio,
+                                       ${DTYPE} *weights_out)
+{
+    int64_t i;
+    int64_t local_n = (int64_t)n;
+    ${DTYPE} inv_falloff = 1.0 / (1.0 - center_ratio + 1e-12);
+
+    #pragma omp parallel for schedule(static)
+    for (i = 0; i < local_n; i++)
+    {
+        ${DTYPE} dx = fabs(points_xy[2 * i]     - roi_cx) / roi_half_sx;
+        ${DTYPE} dy = fabs(points_xy[2 * i + 1] - roi_cy) / roi_half_sy;
+        ${DTYPE} d = dx > dy ? dx : dy;
+        ${DTYPE} w = 1.0 - (d - center_ratio) * inv_falloff;
+        if (w < 0.0) w = 0.0;
+        if (w > 1.0) w = 1.0;
+        weights_out[i] = w;
+    }
+}
+
+/************************************************
+Accumulate predictions with overlap weights.
+
+Strategies:
+  0 = "center": keep prediction with highest weight per point
+  1 = "mean":   weighted sum of logits/probas
+  2 = "vote":   weighted vote counting per class
+
+For "center" (strategy=0):
+    preds: (m,) int32 class predictions
+    acc_preds: (n_points,) int32 accumulator (init to default_value)
+    acc_weights: (n_points,) float accumulator (init to 0)
+
+For "mean" (strategy=1):
+    preds: (m * n_classes) float predictions (row-major)
+    acc_sum: (n_points * n_classes) float accumulator (init to 0)
+    acc_weights: (n_points,) float accumulator (init to 0)
+
+For "vote" (strategy=2):
+    preds: (m,) int32 class predictions
+    acc_votes: (n_points * n_classes) float accumulator (init to 0)
+    acc_has_pred: (n_points,) uint8 flag (init to 0)
+
+Params:
+    row_ids       : (m,) global point indices
+    weights       : (m,) overlap weights
+    m             : number of points in this ROI
+    strategy      : 0=center, 1=mean, 2=vote
+    n_classes     : number of classes (for mean/vote)
+    preds_int     : (m,) int32 predictions (center/vote)
+    preds_float   : (m * n_classes) float predictions (mean)
+    acc_preds_int : (n_points,) int32 accumulator (center)
+    acc_weights   : (n_points,) float accumulator (center/mean)
+    acc_sum       : (n_points * n_classes) float accumulator (mean)
+    acc_votes     : (n_points * n_classes) float accumulator (vote)
+    acc_has_pred  : (n_points,) uint8 flag (vote)
+************************************************/
+void accumulate_predictions_${DTYPE}(uint64_t *row_ids, ${DTYPE} *weights,
+                                      uint64_t m, int strategy,
+                                      uint64_t n_classes,
+                                      int32_t *preds_int,
+                                      ${DTYPE} *preds_float,
+                                      int32_t *acc_preds_int,
+                                      ${DTYPE} *acc_weights,
+                                      ${DTYPE} *acc_sum,
+                                      ${DTYPE} *acc_votes,
+                                      uint8_t *acc_has_pred)
+{
+    uint64_t i, j;
+
+    if (strategy == 0)
+    {
+        /* center: keep highest weight — sequential due to potential conflicts */
+        for (i = 0; i < m; i++)
+        {
+            uint64_t idx = row_ids[i];
+            if (weights[i] > acc_weights[idx])
+            {
+                acc_weights[idx] = weights[i];
+                acc_preds_int[idx] = preds_int[i];
+            }
+        }
+    }
+    else if (strategy == 1)
+    {
+        /* mean: weighted sum — sequential scatter */
+        for (i = 0; i < m; i++)
+        {
+            uint64_t idx = row_ids[i];
+            ${DTYPE} w = weights[i];
+            acc_weights[idx] += w;
+            for (j = 0; j < n_classes; j++)
+                acc_sum[idx * n_classes + j] += preds_float[i * n_classes + j] * w;
+        }
+    }
+    else /* strategy == 2: vote */
+    {
+        for (i = 0; i < m; i++)
+        {
+            uint64_t idx = row_ids[i];
+            int32_t cls = preds_int[i];
+            if (cls >= 0 && (uint64_t)cls < n_classes)
+            {
+                acc_votes[idx * n_classes + cls] += weights[i];
+                acc_has_pred[idx] = 1;
+            }
+        }
+    }
+}
+
+/************************************************
+Finalize accumulated predictions.
+
+For "center" (strategy=0): no-op (already done during accumulate)
+For "mean" (strategy=1): divide sum by weight, normalize if probas
+For "vote" (strategy=2): argmax over vote counts
+
+Params:
+    n_points      : total number of points
+    strategy      : 0=center, 1=mean, 2=vote
+    n_classes     : number of classes
+    is_probas     : 1 if output should be re-normalized as probabilities
+    default_value : fill value for points with no predictions
+    acc_preds_int : (n_points,) int32 (center result, or vote output)
+    acc_weights   : (n_points,) float weights (mean)
+    acc_sum       : (n_points * n_classes) float sums (mean input)
+    result_float  : (n_points * n_classes) float output (mean)
+    acc_votes     : (n_points * n_classes) float vote counts
+    acc_has_pred  : (n_points,) uint8 flags (vote)
+************************************************/
+void finalize_predictions_${DTYPE}(uint64_t n_points, int strategy,
+                                    uint64_t n_classes, int is_probas,
+                                    ${DTYPE} default_value,
+                                    int32_t *acc_preds_int,
+                                    ${DTYPE} *acc_weights,
+                                    ${DTYPE} *acc_sum,
+                                    ${DTYPE} *result_float,
+                                    ${DTYPE} *acc_votes,
+                                    uint8_t *acc_has_pred)
+{
+    int64_t i;
+    int64_t local_n = (int64_t)n_points;
+    uint64_t j;
+
+    if (strategy == 1) /* mean */
+    {
+        #pragma omp parallel for schedule(static) private(j)
+        for (i = 0; i < local_n; i++)
+        {
+            if (acc_weights[i] > 0)
+            {
+                ${DTYPE} inv_w = 1.0 / acc_weights[i];
+                ${DTYPE} row_sum = 0;
+                for (j = 0; j < n_classes; j++)
+                {
+                    result_float[i * n_classes + j] = acc_sum[i * n_classes + j] * inv_w;
+                    row_sum += result_float[i * n_classes + j];
+                }
+                if (is_probas && row_sum > 1e-8)
+                {
+                    ${DTYPE} inv_sum = 1.0 / row_sum;
+                    for (j = 0; j < n_classes; j++)
+                        result_float[i * n_classes + j] *= inv_sum;
+                }
+            }
+            else
+            {
+                for (j = 0; j < n_classes; j++)
+                    result_float[i * n_classes + j] = default_value;
+            }
+        }
+    }
+    else if (strategy == 2) /* vote */
+    {
+        #pragma omp parallel for schedule(static) private(j)
+        for (i = 0; i < local_n; i++)
+        {
+            if (acc_has_pred[i])
+            {
+                int32_t best_cls = 0;
+                ${DTYPE} best_val = acc_votes[i * n_classes];
+                for (j = 1; j < n_classes; j++)
+                {
+                    if (acc_votes[i * n_classes + j] > best_val)
+                    {
+                        best_val = acc_votes[i * n_classes + j];
+                        best_cls = (int32_t)j;
+                    }
+                }
+                acc_preds_int[i] = best_cls;
+            }
+            /* else: already default_value */
+        }
+    }
+    /* strategy == 0 (center): nothing to do */
+}
+
+/************************************************
+Filter points to core bbox and scatter results to original indices.
+
+Fuses:
+  1. Core mask computation (2D bbox filter on XY)
+  2. Scatter attributes by original row indices
+
+Params:
+    points_xy     : (n * 2) contiguous XY coords of all points (buffer+core)
+    n             : number of points
+    core_min_x/y  : core bbox lower bounds
+    core_max_x/y  : core bbox upper bounds (exclusive)
+    row_indices   : (n,) original row indices in the output array
+    src_values    : (n * n_cols) source values to scatter (contiguous, row-major)
+    n_cols        : number of columns to scatter
+    dst_values    : (n_dst * n_cols) output array (pre-allocated)
+    core_mask_out : (n,) output boolean mask (1 = inside core)
+    n_core_out    : number of points in core (return)
+************************************************/
+void unbuffer_and_scatter_${DTYPE}(${DTYPE} *points_xy, uint64_t n,
+                                    ${DTYPE} core_min_x, ${DTYPE} core_min_y,
+                                    ${DTYPE} core_max_x, ${DTYPE} core_max_y,
+                                    uint64_t *row_indices,
+                                    ${DTYPE} *src_values, uint64_t n_cols,
+                                    ${DTYPE} *dst_values,
+                                    uint8_t *core_mask_out,
+                                    uint64_t *n_core_out)
+{
+    int64_t i;
+    int64_t local_n = (int64_t)n;
+    uint64_t j;
+    uint64_t n_core = 0;
+
+    /* Pass 1: compute core mask (parallel) */
+    #pragma omp parallel for reduction(+:n_core) schedule(static)
+    for (i = 0; i < local_n; i++)
+    {
+        ${DTYPE} px = points_xy[2 * i];
+        ${DTYPE} py = points_xy[2 * i + 1];
+        if (px >= core_min_x && px < core_max_x &&
+            py >= core_min_y && py < core_max_y)
+        {
+            core_mask_out[i] = 1;
+            n_core++;
+        }
+        else
+        {
+            core_mask_out[i] = 0;
+        }
+    }
+
+    *n_core_out = n_core;
+
+    /* Pass 2: scatter core values to destination (parallel) */
+    if (src_values && dst_values && row_indices)
+    {
+        #pragma omp parallel for schedule(static) private(j)
+        for (i = 0; i < local_n; i++)
+        {
+            if (core_mask_out[i])
+            {
+                uint64_t dst_idx = row_indices[i];
+                for (j = 0; j < n_cols; j++)
+                    dst_values[dst_idx * n_cols + j] = src_values[i * n_cols + j];
+            }
+        }
+    }
+}
+
 % endfor
 
 /* =========================================================

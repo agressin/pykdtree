@@ -324,6 +324,203 @@ def bench_voxelize(n):
                                       voxelize, points, voxel_size)
 
 
+def bench_overlap_weights(n):
+    print(f"\n=== Overlap weights  (N={n:,}) ===")
+    from pykdtree.spatial import compute_overlap_weights
+
+    points_xy = np.random.rand(n, 2).astype(np.float32) * 100
+    roi_center = (50.0, 50.0)
+    roi_half_size = (50.0, 50.0)
+    center_ratio = 0.6
+
+    w_c, dt_c = timer("pykdtree.spatial.compute_overlap_weights",
+                       compute_overlap_weights, points_xy, roi_center, roi_half_size, center_ratio)
+
+    # numpy reference (same as projax _compute_weights)
+    def np_weights(xy, cx, cy, hsx, hsy, cr):
+        dx = np.abs(xy[:, 0] - cx) / hsx
+        dy = np.abs(xy[:, 1] - cy) / hsy
+        d_max = np.maximum(dx, dy)
+        return np.clip(1.0 - (d_max - cr) / (1.0 - cr), 0.0, 1.0).astype(np.float32)
+
+    w_np, dt_np = timer("numpy (projax _compute_weights)", np_weights,
+                         points_xy, 50.0, 50.0, 50.0, 50.0, 0.6)
+
+    assert np.allclose(w_c, w_np, atol=1e-5), "Weight mismatch!"
+    print(f"  Speedup: {dt_np/dt_c:.1f}x")
+
+
+def bench_prediction_accumulator(n_points, n_rois, pts_per_roi):
+    print(f"\n=== PredictionAccumulator  ({n_points:,} pts, {n_rois} ROIs × {pts_per_roi:,} pts/ROI) ===")
+    from pykdtree.spatial import PredictionAccumulator as CAccumulator
+
+    n_classes = 20
+
+    # Generate ROI data — unique ids per ROI (like real inference)
+    roi_data = []
+    for _ in range(n_rois):
+        ids = np.random.choice(n_points, pts_per_roi, replace=False).astype(np.uint64)
+        preds = np.random.randint(0, n_classes, pts_per_roi, dtype=np.int32)
+        weights = np.random.rand(pts_per_roi).astype(np.float32)
+        roi_data.append((ids, preds, weights))
+
+    # --- pykdtree C: center strategy ---
+    def c_center():
+        acc = CAccumulator(n_points, 'classes', strategy='center')
+        for ids, preds, weights in roi_data:
+            acc.add(ids, preds, weights)
+        return acc.aggregate()
+
+    result_c, dt_c = timer("pykdtree center strategy", c_center)
+
+    # --- projax PredictionAccumulator ---
+    try:
+        import sys
+        if '/home/adrien/Dev/ProJax3D/projax3d/src' not in sys.path:
+            sys.path.insert(0, '/home/adrien/Dev/ProJax3D/projax3d/src')
+        from projax3d.interop.common.inference import PredictionAccumulator as ProjaxAccumulator
+        has_projax = True
+    except ImportError:
+        has_projax = False
+
+    def np_center():
+        if has_projax:
+            acc = ProjaxAccumulator(n_points, 'classes', strategy='center')
+            for ids, preds, weights in roi_data:
+                acc.add(ids, preds, weights)
+            return acc.aggregate()
+        else:
+            predictions = np.full(n_points, -1, dtype=np.int32)
+            w_acc = np.zeros(n_points, dtype=np.float32)
+            for ids, preds, weights in roi_data:
+                update_mask = weights > w_acc[ids]
+                update_ids = ids[update_mask]
+                w_acc[update_ids] = weights[update_mask]
+                predictions[update_ids] = preds[update_mask]
+            return predictions
+
+    label = "projax PredictionAccumulator center" if has_projax else "numpy center (projax style)"
+    result_np, dt_np = timer(label, np_center)
+    assert np.array_equal(result_c, result_np), "Center mismatch!"
+    print(f"  Center speedup: {dt_np/dt_c:.1f}x")
+
+    # --- pykdtree C: vote strategy ---
+    def c_vote():
+        acc = CAccumulator(n_points, 'classes', n_classes=n_classes, strategy='vote')
+        for ids, preds, weights in roi_data:
+            acc.add(ids, preds, weights)
+        return acc.aggregate()
+
+    result_cv, dt_cv = timer("pykdtree vote strategy", c_vote)
+
+    def np_vote():
+        if has_projax:
+            acc = ProjaxAccumulator(n_points, 'classes', n_classes=n_classes, strategy='vote')
+            for ids, preds, weights in roi_data:
+                acc.add(ids, preds, weights)
+            return acc.aggregate()
+        else:
+            votes = np.zeros((n_points, n_classes), dtype=np.float32)
+            has_pred = np.zeros(n_points, dtype=bool)
+            for ids, preds, weights in roi_data:
+                valid = (preds >= 0) & (preds < n_classes)
+                np.add.at(votes, (ids[valid], preds[valid]), weights[valid])
+                has_pred[ids[valid]] = True
+            result = np.full(n_points, -1, dtype=np.int32)
+            result[has_pred] = votes[has_pred].argmax(axis=1)
+            return result
+
+    label = "projax PredictionAccumulator vote" if has_projax else "numpy vote (np.add.at)"
+    result_nv, dt_nv = timer(label, np_vote)
+    assert np.array_equal(result_cv, result_nv), "Vote mismatch!"
+    print(f"  Vote speedup: {dt_nv/dt_cv:.1f}x")
+
+    # --- pykdtree C: mean strategy (logits) ---
+    logit_data = []
+    for _ in range(n_rois):
+        ids = np.random.choice(n_points, pts_per_roi, replace=False).astype(np.uint64)
+        logits = np.random.rand(pts_per_roi, n_classes).astype(np.float32)
+        weights = np.random.rand(pts_per_roi).astype(np.float32)
+        logit_data.append((ids, logits, weights))
+
+    def c_mean():
+        acc = CAccumulator(n_points, 'logits', n_classes=n_classes, strategy='mean')
+        for ids, logits, weights in logit_data:
+            acc.add(ids, logits, weights)
+        return acc.aggregate()
+
+    result_cm, dt_cm = timer("pykdtree mean strategy (logits)", c_mean)
+
+    def np_mean():
+        if has_projax:
+            acc = ProjaxAccumulator(n_points, 'logits', n_classes=n_classes, strategy='mean')
+            for ids, logits, weights in logit_data:
+                acc.add(ids, logits, weights)
+            return acc.aggregate()
+        else:
+            sum_vals = np.zeros((n_points, n_classes), dtype=np.float32)
+            sum_weights = np.zeros(n_points, dtype=np.float32)
+            for ids, logits, weights in logit_data:
+                np.add.at(sum_weights, ids, weights)
+                np.add.at(sum_vals, ids, logits * weights[:, np.newaxis])
+            result = np.full((n_points, n_classes), -1.0, dtype=np.float32)
+            mask = sum_weights > 0
+            result[mask] = sum_vals[mask] / sum_weights[mask, np.newaxis]
+            return result
+
+    label = "projax PredictionAccumulator mean" if has_projax else "numpy mean (np.add.at)"
+    result_nm, dt_nm = timer(label, np_mean)
+    mask_both = (result_cm[:, 0] != -1) & (result_nm[:, 0] != -1)
+    assert np.allclose(result_cm[mask_both], result_nm[mask_both], atol=1e-4), "Mean mismatch!"
+    print(f"  Mean speedup: {dt_nm/dt_cm:.1f}x")
+
+
+def bench_unbuffer_and_scatter(n):
+    print(f"\n=== Unbuffer and scatter  (N={n:,}) ===")
+    from pykdtree.spatial import unbuffer_and_scatter
+
+    points_xy = np.random.rand(n, 2).astype(np.float32) * 100
+    core_bbox = (20.0, 20.0, 80.0, 80.0)
+
+    # --- mask only ---
+    (mask_c, n_core_c), dt_c = timer("pykdtree unbuffer (mask only)",
+                                      unbuffer_and_scatter, points_xy, core_bbox)
+
+    def np_core_mask(xy, bbox):
+        m = ((xy[:, 0] >= bbox[0]) & (xy[:, 0] < bbox[2]) &
+             (xy[:, 1] >= bbox[1]) & (xy[:, 1] < bbox[3]))
+        return m, m.sum()
+
+    (mask_np, n_core_np), dt_np = timer("numpy boolean mask", np_core_mask, points_xy, core_bbox)
+    assert n_core_c == n_core_np, f"Count mismatch: {n_core_c} vs {n_core_np}"
+    print(f"  Core points: {n_core_c:,} / {n:,} ({n_core_c*100/n:.0f}%)")
+    print(f"  Mask speedup: {dt_np/dt_c:.1f}x")
+
+    # --- mask + scatter ---
+    n_cols = 5
+    row_indices = np.arange(n, dtype=np.uint64)
+    src_values = np.random.rand(n, n_cols).astype(np.float32)
+    dst_values = np.zeros((n, n_cols), dtype=np.float32)
+
+    def c_scatter():
+        dst = np.zeros((n, n_cols), dtype=np.float32)
+        unbuffer_and_scatter(points_xy, core_bbox, row_indices, src_values, dst)
+        return dst
+
+    dst_c, dt_cs = timer("pykdtree unbuffer+scatter (5 cols)", c_scatter)
+
+    def np_scatter():
+        mask = ((points_xy[:, 0] >= core_bbox[0]) & (points_xy[:, 0] < core_bbox[2]) &
+                (points_xy[:, 1] >= core_bbox[1]) & (points_xy[:, 1] < core_bbox[3]))
+        dst = np.zeros((n, n_cols), dtype=np.float32)
+        dst[row_indices[mask]] = src_values[mask]
+        return dst
+
+    dst_np, dt_ns = timer("numpy mask + scatter (5 cols)", np_scatter)
+    assert np.allclose(dst_c, dst_np), "Scatter mismatch!"
+    print(f"  Scatter speedup: {dt_ns/dt_cs:.1f}x")
+
+
 def bench_kdtree_new_methods(n):
     print(f"\n=== KDTree: radius_filter + estimate_normals  (N={n:,}) ===")
     from pykdtree.kdtree import KDTree
@@ -355,6 +552,9 @@ if __name__ == "__main__":
     bench_merge_tiles(20, 100_000)   # 20 tiles × 100K = 2M points
     bench_merge_tiles(100, 100_000)  # 100 tiles × 100K = 10M points
     bench_voxelize(N)
+    bench_overlap_weights(N)
+    bench_prediction_accumulator(N, 50, 100_000)  # 2M pts, 50 ROIs × 100K
+    bench_unbuffer_and_scatter(N)
     bench_kdtree_new_methods(N)
 
     print(f"\n{'='*60}")
