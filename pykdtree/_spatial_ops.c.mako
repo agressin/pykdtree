@@ -28,6 +28,9 @@ OpenMP-parallelized where applicable.
 #include <float.h>
 #include <math.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define DIST_MAX_float FLT_MAX
 #define DIST_MAX_double DBL_MAX
@@ -1007,6 +1010,192 @@ void unbuffer_and_scatter_${DTYPE}(${DTYPE} *points_xy, uint64_t n,
                 uint64_t dst_idx = row_indices[i];
                 for (j = 0; j < n_cols; j++)
                     dst_values[dst_idx * n_cols + j] = src_values[i * n_cols + j];
+            }
+        }
+    }
+}
+
+/************************************************
+Parallel scatter-reduce: scatter values into bins with reduction.
+
+Supports multiple reduction methods:
+  0 = sum     : out[idx] += val
+  1 = min     : out[idx] = min(out[idx], val)
+  2 = max     : out[idx] = max(out[idx], val)
+  3 = mean    : computes sum + count, caller divides (count_out provided)
+
+Uses thread-local buffers to avoid atomics, then merges.
+Multi-column support: values/output are (n * n_cols) row-major.
+
+Params:
+    indices     : (n,) bin indices (uint64, values in [0, n_bins))
+    values      : (n * n_cols) input values (row-major)
+    n           : number of input elements
+    n_bins      : number of output bins
+    n_cols      : number of value columns
+    method      : reduction method (0=sum, 1=min, 2=max, 3=mean)
+    output      : (n_bins * n_cols) output (pre-allocated, caller inits)
+    count_out   : (n_bins,) count per bin (for mean; NULL if not needed)
+************************************************/
+void scatter_reduce_${DTYPE}(uint64_t *indices, ${DTYPE} *values,
+                              uint64_t n, uint64_t n_bins, uint64_t n_cols,
+                              int method,
+                              ${DTYPE} *output, uint64_t *count_out)
+{
+    int64_t i;
+    int64_t local_n = (int64_t)n;
+    uint64_t j;
+
+    /* For small n_bins, use thread-local approach.
+       For very large n_bins, fall back to sequential to avoid huge allocs. */
+    int n_threads = 1;
+    #ifdef _OPENMP
+    #pragma omp parallel
+    { n_threads = omp_get_num_threads(); }
+    #endif
+
+    uint64_t bin_bytes = n_bins * n_cols * sizeof(${DTYPE});
+    /* Use parallel reduction if we can afford thread-local copies (< 64 MB total) */
+    int use_parallel = (n_threads > 1) && ((uint64_t)n_threads * bin_bytes < 64ULL * 1024 * 1024);
+
+    if (use_parallel)
+    {
+        /* Allocate thread-local accumulators */
+        ${DTYPE} **local_out = (${DTYPE} **)malloc(n_threads * sizeof(${DTYPE} *));
+        uint64_t **local_cnt = NULL;
+        if (method == 3 || count_out)
+            local_cnt = (uint64_t **)malloc(n_threads * sizeof(uint64_t *));
+
+        int t;
+        for (t = 0; t < n_threads; t++)
+        {
+            local_out[t] = (${DTYPE} *)malloc(n_bins * n_cols * sizeof(${DTYPE}));
+            if (method == 1) /* min: init to +inf */
+                for (j = 0; j < n_bins * n_cols; j++)
+                    local_out[t][j] = DIST_MAX_${DTYPE};
+            else if (method == 2) /* max: init to -inf */
+                for (j = 0; j < n_bins * n_cols; j++)
+                    local_out[t][j] = -DIST_MAX_${DTYPE};
+            else /* sum/mean: init to 0 */
+                memset(local_out[t], 0, n_bins * n_cols * sizeof(${DTYPE}));
+
+            if (local_cnt)
+            {
+                local_cnt[t] = (uint64_t *)calloc(n_bins, sizeof(uint64_t));
+            }
+        }
+
+        /* Scatter into thread-local buffers */
+        #pragma omp parallel
+        {
+            int tid = 0;
+            #ifdef _OPENMP
+            tid = omp_get_thread_num();
+            #endif
+            ${DTYPE} *my_out = local_out[tid];
+            uint64_t *my_cnt = local_cnt ? local_cnt[tid] : NULL;
+            int64_t ii;
+
+            #pragma omp for schedule(static)
+            for (ii = 0; ii < local_n; ii++)
+            {
+                uint64_t idx = indices[ii];
+                if (idx >= n_bins) continue;
+                uint64_t jj;
+
+                if (method == 0 || method == 3) /* sum / mean */
+                {
+                    for (jj = 0; jj < n_cols; jj++)
+                        my_out[idx * n_cols + jj] += values[ii * n_cols + jj];
+                    if (my_cnt) my_cnt[idx]++;
+                }
+                else if (method == 1) /* min */
+                {
+                    for (jj = 0; jj < n_cols; jj++)
+                    {
+                        ${DTYPE} v = values[ii * n_cols + jj];
+                        if (v < my_out[idx * n_cols + jj])
+                            my_out[idx * n_cols + jj] = v;
+                    }
+                }
+                else /* max */
+                {
+                    for (jj = 0; jj < n_cols; jj++)
+                    {
+                        ${DTYPE} v = values[ii * n_cols + jj];
+                        if (v > my_out[idx * n_cols + jj])
+                            my_out[idx * n_cols + jj] = v;
+                    }
+                }
+            }
+        }
+
+        /* Merge thread-local results into output */
+        #pragma omp parallel for schedule(static) private(j)
+        for (i = 0; i < (int64_t)n_bins; i++)
+        {
+            for (t = 0; t < n_threads; t++)
+            {
+                for (j = 0; j < n_cols; j++)
+                {
+                    uint64_t ij = i * n_cols + j;
+                    if (method == 0 || method == 3)
+                        output[ij] += local_out[t][ij];
+                    else if (method == 1)
+                    {
+                        if (local_out[t][ij] < output[ij])
+                            output[ij] = local_out[t][ij];
+                    }
+                    else
+                    {
+                        if (local_out[t][ij] > output[ij])
+                            output[ij] = local_out[t][ij];
+                    }
+                }
+                if (local_cnt && count_out)
+                    count_out[i] += local_cnt[t][i];
+            }
+        }
+
+        for (t = 0; t < n_threads; t++)
+        {
+            free(local_out[t]);
+            if (local_cnt) free(local_cnt[t]);
+        }
+        free(local_out);
+        if (local_cnt) free(local_cnt);
+    }
+    else
+    {
+        /* Sequential fallback */
+        for (i = 0; i < local_n; i++)
+        {
+            uint64_t idx = indices[i];
+            if (idx >= n_bins) continue;
+
+            if (method == 0 || method == 3)
+            {
+                for (j = 0; j < n_cols; j++)
+                    output[idx * n_cols + j] += values[i * n_cols + j];
+                if (count_out) count_out[idx]++;
+            }
+            else if (method == 1)
+            {
+                for (j = 0; j < n_cols; j++)
+                {
+                    ${DTYPE} v = values[i * n_cols + j];
+                    if (v < output[idx * n_cols + j])
+                        output[idx * n_cols + j] = v;
+                }
+            }
+            else
+            {
+                for (j = 0; j < n_cols; j++)
+                {
+                    ${DTYPE} v = values[i * n_cols + j];
+                    if (v > output[idx * n_cols + j])
+                        output[idx * n_cols + j] = v;
+                }
             }
         }
     }

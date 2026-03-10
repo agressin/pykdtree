@@ -161,6 +161,15 @@ cdef extern void finalize_predictions_double(uint64_t n_points, int strategy,
                                               double *acc_votes,
                                               uint8_t *acc_has_pred) nogil
 
+cdef extern void scatter_reduce_float(uint64_t *indices, float *values,
+                                       uint64_t n, uint64_t n_bins, uint64_t n_cols,
+                                       int method,
+                                       float *output, uint64_t *count_out) nogil
+cdef extern void scatter_reduce_double(uint64_t *indices, double *values,
+                                        uint64_t n, uint64_t n_bins, uint64_t n_cols,
+                                        int method,
+                                        double *output, uint64_t *count_out) nogil
+
 cdef extern void unbuffer_and_scatter_float(float *points_xy, uint64_t n,
                                              float core_min_x, float core_min_y,
                                              float core_max_x, float core_max_y,
@@ -1229,3 +1238,106 @@ def unbuffer_and_scatter(np.ndarray points_xy not None,
                 <uint8_t *>core_mask.data, &n_core)
 
     return core_mask.view(np.bool_), int(n_core)
+
+
+def scatter_reduce(np.ndarray indices not None, np.ndarray values not None,
+                   uint64_t n_bins, str method='sum'):
+    """Parallel scatter-reduce: accumulate values into bins.
+
+    OpenMP-accelerated using thread-local buffers to avoid atomics.
+    Replaces ``np.add.at``, ``np.minimum.at``, ``np.maximum.at``.
+
+    :Parameters:
+    indices : numpy uint64 array, shape (n,)
+        Bin indices in ``[0, n_bins)``.
+    values : numpy array, shape (n,) or (n, k)
+        Values to scatter (float32 or float64).
+    n_bins : int
+        Number of output bins.
+    method : str
+        ``'sum'``, ``'min'``, ``'max'``, or ``'mean'``.
+
+    :Returns:
+    output : numpy array, shape (n_bins,) or (n_bins, k)
+        Reduced values per bin.
+    counts : numpy uint64 array, shape (n_bins,)
+        Count per bin. Only returned for ``method='mean'``.
+    """
+    cdef int c_method = 0
+    if method == 'min':
+        c_method = 1
+    elif method == 'max':
+        c_method = 2
+    elif method == 'mean':
+        c_method = 3
+    elif method != 'sum':
+        raise ValueError("method must be 'sum', 'min', 'max', or 'mean'")
+
+    cdef np.ndarray[uint64_t, ndim=1] idx = np.ascontiguousarray(indices.ravel(), dtype=np.uint64)
+    cdef uint64_t n = <uint64_t>idx.shape[0]
+    cdef uint64_t n_cols = 1
+    cdef bint is_2d = values.ndim == 2
+
+    if is_2d:
+        n_cols = <uint64_t>values.shape[1]
+
+    cdef np.ndarray[float, ndim=1] vals_f, out_f
+    cdef np.ndarray[double, ndim=1] vals_d, out_d
+    cdef np.ndarray[uint64_t, ndim=1] counts
+    cdef uint64_t *count_ptr = NULL
+
+    if c_method == 3:  # mean: need counts
+        counts = np.zeros(n_bins, dtype=np.uint64)
+        count_ptr = <uint64_t *>counts.data
+
+    if values.dtype == np.float32:
+        vals_f = np.ascontiguousarray(values.ravel(), dtype=np.float32)
+        out_f = np.empty(n_bins * n_cols, dtype=np.float32)
+        # Initialize output
+        if c_method == 1:  # min
+            out_f[:] = np.finfo(np.float32).max
+        elif c_method == 2:  # max
+            out_f[:] = -np.finfo(np.float32).max
+        else:
+            out_f[:] = 0
+
+        with nogil:
+            scatter_reduce_float(<uint64_t *>idx.data, <float *>vals_f.data,
+                                  n, n_bins, n_cols, c_method,
+                                  <float *>out_f.data, count_ptr)
+
+        if c_method == 3:  # mean: divide by count
+            result = out_f.reshape(n_bins, n_cols) if is_2d else out_f
+            mask = counts > 0
+            if is_2d:
+                result[mask] /= counts[mask, np.newaxis].astype(np.float32)
+            else:
+                result[mask] /= counts[mask].astype(np.float32)
+            return result, counts
+        result = out_f.reshape(n_bins, n_cols) if is_2d else out_f
+        return result
+    else:
+        vals_d = np.ascontiguousarray(values.ravel(), dtype=np.float64)
+        out_d = np.empty(n_bins * n_cols, dtype=np.float64)
+        if c_method == 1:
+            out_d[:] = np.finfo(np.float64).max
+        elif c_method == 2:
+            out_d[:] = -np.finfo(np.float64).max
+        else:
+            out_d[:] = 0
+
+        with nogil:
+            scatter_reduce_double(<uint64_t *>idx.data, <double *>vals_d.data,
+                                   n, n_bins, n_cols, c_method,
+                                   <double *>out_d.data, count_ptr)
+
+        if c_method == 3:
+            result = out_d.reshape(n_bins, n_cols) if is_2d else out_d
+            mask = counts > 0
+            if is_2d:
+                result[mask] /= counts[mask, np.newaxis].astype(np.float64)
+            else:
+                result[mask] /= counts[mask].astype(np.float64)
+            return result, counts
+        result = out_d.reshape(n_bins, n_cols) if is_2d else out_d
+        return result

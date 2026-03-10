@@ -521,6 +521,83 @@ def bench_unbuffer_and_scatter(n):
     print(f"  Scatter speedup: {dt_ns/dt_cs:.1f}x")
 
 
+def bench_scatter_reduce(n):
+    print(f"\n=== Scatter reduce  (N={n:,}) ===")
+    from pykdtree.spatial import scatter_reduce
+
+    n_bins = 50_000  # typical grid/voxel count
+    indices = np.random.randint(0, n_bins, n, dtype=np.uint64)
+    values = np.random.rand(n).astype(np.float32)
+
+    # --- sum: 1 column ---
+    out_c, dt_c = timer("pykdtree scatter_reduce sum (1 col)", scatter_reduce, indices, values, n_bins, 'sum')
+    def np_sum():
+        out = np.zeros(n_bins, dtype=np.float32)
+        np.add.at(out, indices, values)
+        return out
+    out_np, dt_np = timer("numpy np.add.at (1 col)", np_sum)
+    assert np.allclose(out_c, out_np, rtol=1e-4)
+    print(f"  Sum speedup: {dt_np/dt_c:.1f}x")
+
+    # --- min: 1 column ---
+    out_c, dt_c = timer("pykdtree scatter_reduce min (1 col)", scatter_reduce, indices, values, n_bins, 'min')
+    def np_min():
+        out = np.full(n_bins, np.finfo(np.float32).max, dtype=np.float32)
+        np.minimum.at(out, indices, values)
+        return out
+    out_np, dt_np = timer("numpy np.minimum.at (1 col)", np_min)
+    assert np.allclose(out_c, out_np)
+    print(f"  Min speedup: {dt_np/dt_c:.1f}x")
+
+    # --- max: 1 column ---
+    out_c, dt_c = timer("pykdtree scatter_reduce max (1 col)", scatter_reduce, indices, values, n_bins, 'max')
+    def np_max():
+        out = np.full(n_bins, -np.finfo(np.float32).max, dtype=np.float32)
+        np.maximum.at(out, indices, values)
+        return out
+    out_np, dt_np = timer("numpy np.maximum.at (1 col)", np_max)
+    assert np.allclose(out_c, out_np)
+    print(f"  Max speedup: {dt_np/dt_c:.1f}x")
+
+    # --- sum: multi-column (BEV-like: 3 feature channels) ---
+    vals_3 = np.random.rand(n, 3).astype(np.float32)
+    out_c3, dt_c3 = timer("pykdtree scatter_reduce sum (3 cols)", scatter_reduce, indices, vals_3, n_bins, 'sum')
+    def np_sum3():
+        out = np.zeros((n_bins, 3), dtype=np.float32)
+        np.add.at(out, indices, vals_3)
+        return out
+    out_np3, dt_np3 = timer("numpy np.add.at (3 cols)", np_sum3)
+    assert np.allclose(out_c3, out_np3, rtol=1e-4)
+    print(f"  Sum 3-col speedup: {dt_np3/dt_c3:.1f}x")
+
+    # --- mean: multi-column (voxelization-like) ---
+    (out_cm, cnt_cm), dt_cm = timer("pykdtree scatter_reduce mean (3 cols)", scatter_reduce, indices, vals_3, n_bins, 'mean')
+    def np_mean3():
+        out = np.zeros((n_bins, 3), dtype=np.float32)
+        cnt = np.zeros(n_bins, dtype=np.int64)
+        np.add.at(out, indices, vals_3)
+        np.add.at(cnt, indices, 1)
+        mask = cnt > 0
+        out[mask] /= cnt[mask, np.newaxis]
+        return out, cnt
+    (out_nm, cnt_nm), dt_nm = timer("numpy add.at + count (3 cols)", np_mean3)
+    mask = cnt_cm > 0
+    assert np.allclose(out_cm[mask], out_nm[mask], rtol=1e-4)
+    print(f"  Mean 3-col speedup: {dt_nm/dt_cm:.1f}x")
+
+    # --- Large bin count (raster-like: 1M bins) ---
+    n_bins_large = 1_000_000
+    indices_large = np.random.randint(0, n_bins_large, n, dtype=np.uint64)
+    out_cl, dt_cl = timer("pykdtree scatter sum (1M bins)", scatter_reduce, indices_large, values, n_bins_large, 'sum')
+    def np_sum_large():
+        out = np.zeros(n_bins_large, dtype=np.float32)
+        np.add.at(out, indices_large, values)
+        return out
+    out_nl, dt_nl = timer("numpy np.add.at (1M bins)", np_sum_large)
+    assert np.allclose(out_cl, out_nl, rtol=1e-4)
+    print(f"  Sum 1M-bins speedup: {dt_nl/dt_cl:.1f}x")
+
+
 def bench_kdtree_new_methods(n):
     print(f"\n=== KDTree: radius_filter + estimate_normals  (N={n:,}) ===")
     from pykdtree.kdtree import KDTree
@@ -555,6 +632,7 @@ if __name__ == "__main__":
     bench_overlap_weights(N)
     bench_prediction_accumulator(N, 50, 100_000)  # 2M pts, 50 ROIs × 100K
     bench_unbuffer_and_scatter(N)
+    bench_scatter_reduce(N)
     bench_kdtree_new_methods(N)
 
     print(f"\n{'='*60}")
