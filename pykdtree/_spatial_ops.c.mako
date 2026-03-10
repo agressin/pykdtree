@@ -429,4 +429,189 @@ void filter_points_in_bbox_${DTYPE}(${DTYPE} *points, uint64_t n,
     if (count_out) *count_out = count;
 }
 
+/************************************************
+Merge multiple tiles: ROI filter + coordinate transform + write to single buffer.
+
+Accepts separate x, y, z columns per tile (matches Parquet column layout).
+Two-pass approach:
+  Pass 1: compute per-point mask and per-tile survivor count (parallel across tiles)
+  Pass 2: prefix-sum offsets, then scatter surviving points with transform (parallel)
+
+Params:
+    tile_x_ptrs     : array of n_tiles pointers to x column arrays
+    tile_y_ptrs     : array of n_tiles pointers to y column arrays
+    tile_z_ptrs     : array of n_tiles pointers to z column arrays
+    tile_sizes      : (n_tiles,) number of points per tile
+    tile_offsets    : (n_tiles * 3) per-tile offset (tile_origin - target_origin)
+    n_tiles         : number of tiles
+    roi_min_x/y, roi_max_x/y : ROI bounds in scene-local coords
+                                Set use_roi=0 to skip filtering
+    use_roi         : 1 = apply ROI filter, 0 = take all points
+    xyz_out         : pre-allocated output buffer (sum(tile_sizes) * 3), interleaved
+    mask_ptrs       : array of n_tiles pointers to (tile_sizes[t],) uint8 mask arrays
+    tile_counts_out : (n_tiles,) number of survivors per tile
+    total_out       : total number of points written
+************************************************/
+void merge_tiles_${DTYPE}(${DTYPE} **tile_x_ptrs, ${DTYPE} **tile_y_ptrs,
+                           ${DTYPE} **tile_z_ptrs,
+                           uint64_t *tile_sizes,
+                           ${DTYPE} *tile_offsets, uint64_t n_tiles,
+                           ${DTYPE} roi_min_x, ${DTYPE} roi_min_y,
+                           ${DTYPE} roi_max_x, ${DTYPE} roi_max_y,
+                           int use_roi,
+                           ${DTYPE} *xyz_out, uint8_t **mask_ptrs,
+                           uint64_t *tile_counts_out, uint64_t *total_out)
+{
+    uint64_t t;
+
+    /* Pass 1: compute masks and counts per tile */
+    #pragma omp parallel for schedule(dynamic)
+    for (t = 0; t < n_tiles; t++)
+    {
+        ${DTYPE} *tx = tile_x_ptrs[t];
+        ${DTYPE} *ty = tile_y_ptrs[t];
+        uint8_t *mask = mask_ptrs[t];
+        uint64_t n = tile_sizes[t];
+        ${DTYPE} off_x = tile_offsets[3 * t];
+        ${DTYPE} off_y = tile_offsets[3 * t + 1];
+        uint64_t count = 0;
+        uint64_t i;
+
+        if (use_roi)
+        {
+            /* ROI in tile-local coords: subtract offset to go from scene-local to tile-local */
+            ${DTYPE} local_min_x = roi_min_x - off_x;
+            ${DTYPE} local_max_x = roi_max_x - off_x;
+            ${DTYPE} local_min_y = roi_min_y - off_y;
+            ${DTYPE} local_max_y = roi_max_y - off_y;
+
+            for (i = 0; i < n; i++)
+            {
+                if (tx[i] >= local_min_x && tx[i] < local_max_x &&
+                    ty[i] >= local_min_y && ty[i] < local_max_y)
+                {
+                    mask[i] = 1;
+                    count++;
+                }
+                else
+                {
+                    mask[i] = 0;
+                }
+            }
+        }
+        else
+        {
+            for (i = 0; i < n; i++) mask[i] = 1;
+            count = n;
+        }
+        tile_counts_out[t] = count;
+    }
+
+    /* Prefix sum to compute write offsets */
+    uint64_t *write_offsets = (uint64_t *)malloc((n_tiles + 1) * sizeof(uint64_t));
+    write_offsets[0] = 0;
+    for (t = 0; t < n_tiles; t++)
+        write_offsets[t + 1] = write_offsets[t] + tile_counts_out[t];
+    *total_out = write_offsets[n_tiles];
+
+    /* Pass 2: transform + scatter surviving points to interleaved output */
+    #pragma omp parallel for schedule(dynamic)
+    for (t = 0; t < n_tiles; t++)
+    {
+        ${DTYPE} *tx = tile_x_ptrs[t];
+        ${DTYPE} *ty = tile_y_ptrs[t];
+        ${DTYPE} *tz = tile_z_ptrs[t];
+        uint8_t *mask = mask_ptrs[t];
+        uint64_t n = tile_sizes[t];
+        ${DTYPE} off_x = tile_offsets[3 * t];
+        ${DTYPE} off_y = tile_offsets[3 * t + 1];
+        ${DTYPE} off_z = tile_offsets[3 * t + 2];
+        uint64_t write_pos = write_offsets[t];
+        uint64_t i;
+
+        for (i = 0; i < n; i++)
+        {
+            if (mask[i])
+            {
+                xyz_out[3 * write_pos]     = tx[i] + off_x;
+                xyz_out[3 * write_pos + 1] = ty[i] + off_y;
+                xyz_out[3 * write_pos + 2] = tz[i] + off_z;
+                write_pos++;
+            }
+        }
+    }
+
+    free(write_offsets);
+}
+
 % endfor
+
+/* =========================================================
+   Dtype-agnostic masked concatenation
+   ========================================================= */
+
+/************************************************
+Concatenate multiple arrays, keeping only elements where mask == 1.
+Works with any dtype by operating on raw bytes.
+
+Params:
+    data_ptrs   : array of n_arrays pointers to source data
+    mask_ptrs   : array of n_arrays pointers to uint8 mask arrays
+    sizes       : (n_arrays,) number of elements per array
+    n_arrays    : number of arrays
+    elem_size   : size of one element in bytes (e.g. 4 for float32)
+    out         : pre-allocated output buffer
+    total_out   : total number of elements written (return)
+************************************************/
+void concat_masked(void **data_ptrs, uint8_t **mask_ptrs,
+                   uint64_t *sizes, uint64_t n_arrays,
+                   uint64_t elem_size,
+                   void *out, uint64_t *total_out)
+{
+    uint64_t t;
+
+    /* Pass 1: count survivors per array for write offsets */
+    uint64_t *counts = (uint64_t *)malloc(n_arrays * sizeof(uint64_t));
+    #pragma omp parallel for schedule(dynamic)
+    for (t = 0; t < n_arrays; t++)
+    {
+        uint8_t *mask = mask_ptrs[t];
+        uint64_t n = sizes[t];
+        uint64_t c = 0;
+        uint64_t i;
+        for (i = 0; i < n; i++)
+            c += mask[i];
+        counts[t] = c;
+    }
+
+    /* Prefix sum */
+    uint64_t *write_offsets = (uint64_t *)malloc((n_arrays + 1) * sizeof(uint64_t));
+    write_offsets[0] = 0;
+    for (t = 0; t < n_arrays; t++)
+        write_offsets[t + 1] = write_offsets[t] + counts[t];
+    *total_out = write_offsets[n_arrays];
+
+    /* Pass 2: scatter surviving elements */
+    #pragma omp parallel for schedule(dynamic)
+    for (t = 0; t < n_arrays; t++)
+    {
+        uint8_t *src = (uint8_t *)data_ptrs[t];
+        uint8_t *mask = mask_ptrs[t];
+        uint8_t *dst = (uint8_t *)out + write_offsets[t] * elem_size;
+        uint64_t n = sizes[t];
+        uint64_t write_pos = 0;
+        uint64_t i;
+
+        for (i = 0; i < n; i++)
+        {
+            if (mask[i])
+            {
+                memcpy(dst + write_pos * elem_size, src + i * elem_size, elem_size);
+                write_pos++;
+            }
+        }
+    }
+
+    free(counts);
+    free(write_offsets);
+}

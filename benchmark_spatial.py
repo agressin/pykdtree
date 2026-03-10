@@ -178,6 +178,99 @@ def bench_filter_bbox(n):
     print(f"  Speedup: {dt_np/dt_c:.1f}x")
 
 
+def bench_merge_tiles(n_tiles, pts_per_tile):
+    n_total = n_tiles * pts_per_tile
+    print(f"\n=== Merge tiles  ({n_tiles} tiles × {pts_per_tile:,} pts = {n_total:,}) ===")
+    from pykdtree.spatial import merge_tiles
+
+    # Simulate tiles as separate x, y, z columns (like Parquet output)
+    tiles_cols = []   # [(x, y, z), ...]
+    tiles_stacked = [] # [(n, 3), ...] for numpy reference
+    for t in range(n_tiles):
+        x = np.random.rand(pts_per_tile).astype(np.float32) * 1000
+        y = np.random.rand(pts_per_tile).astype(np.float32) * 1000
+        z = np.random.rand(pts_per_tile).astype(np.float32) * 50
+        tiles_cols.append((x, y, z))
+        tiles_stacked.append(np.column_stack([x, y, z]))
+
+    # Offsets: tile_origin - scene_origin (each tile at different location)
+    offsets = np.zeros((n_tiles, 3), dtype=np.float32)
+    for t in range(n_tiles):
+        offsets[t, 0] = t * 1000.0  # tiles side by side on X
+
+    # ROI: select ~60% of points (center region)
+    roi = (200.0, 200.0, (n_tiles - 1) * 1000 + 800.0, 800.0)
+
+    # --- pykdtree C (separate columns) ---
+    (xyz_c, masks_c), dt_c = timer("pykdtree merge_tiles (x,y,z cols)",
+                                    merge_tiles, tiles_cols, offsets, roi)
+
+    # --- pykdtree C (stacked arrays, backwards compat) ---
+    (xyz_c2, _), dt_c2 = timer("pykdtree merge_tiles (n,3 arrays)",
+                                merge_tiles, tiles_stacked, offsets, roi)
+
+    # --- numpy reference (what projax does) ---
+    def np_merge(tile_list, offs, roi_bounds):
+        results = []
+        for t in range(len(tile_list)):
+            xyz = tile_list[t]
+            off = offs[t]
+            local_min_x = roi_bounds[0] - off[0]
+            local_max_x = roi_bounds[2] - off[0]
+            local_min_y = roi_bounds[1] - off[1]
+            local_max_y = roi_bounds[3] - off[1]
+            mask = ((xyz[:, 0] >= local_min_x) & (xyz[:, 0] < local_max_x) &
+                    (xyz[:, 1] >= local_min_y) & (xyz[:, 1] < local_max_y))
+            results.append(xyz[mask] + off)
+        return np.concatenate(results, axis=0)
+
+    xyz_np, dt_np = timer("numpy mask+transform+concat", np_merge, tiles_stacked, offsets, roi)
+
+    assert xyz_c.shape == xyz_np.shape, f"Shape mismatch: {xyz_c.shape} vs {xyz_np.shape}"
+    assert np.allclose(xyz_c, xyz_np, atol=1e-5), "Value mismatch!"
+    print(f"  Output points: {xyz_c.shape[0]:,} / {n_total:,}")
+    print(f"  Speedup vs numpy: {dt_np/dt_c:.1f}x")
+
+    # --- Benchmark apply_masks for attributes ---
+    from pykdtree.spatial import apply_masks
+
+    # Simulate 3 attributes per tile
+    attr_names = ["intensity", "classification", "gps_time"]
+    attr_dtypes = [np.float32, np.uint8, np.float64]
+    tile_attrs = []
+    for t in range(n_tiles):
+        tile_attrs.append({
+            "intensity": np.random.rand(pts_per_tile).astype(np.float32),
+            "classification": np.random.randint(0, 20, pts_per_tile, dtype=np.uint8),
+            "gps_time": np.random.rand(pts_per_tile).astype(np.float64) * 1e9,
+        })
+
+    # Get masks from the C call above
+    _, masks_for_attrs = merge_tiles(tiles_cols, offsets, roi)
+
+    # --- pykdtree apply_masks ---
+    def c_apply_all(t_attrs, m):
+        result = {}
+        for key in attr_names:
+            result[key] = apply_masks([t_attrs[i][key] for i in range(len(m))], m)
+        return result
+
+    attrs_c, dt_c_attr = timer("pykdtree apply_masks (3 attrs)", c_apply_all, tile_attrs, masks_for_attrs)
+
+    # --- numpy reference ---
+    def np_apply_all(t_attrs, m):
+        result = {}
+        for key in attr_names:
+            result[key] = np.concatenate([t_attrs[i][key][m[i]] for i in range(len(m))])
+        return result
+
+    attrs_np, dt_np_attr = timer("numpy mask+concat (3 attrs)", np_apply_all, tile_attrs, masks_for_attrs)
+
+    for key in attr_names:
+        assert np.array_equal(attrs_c[key], attrs_np[key]), f"Attr {key} mismatch!"
+    print(f"  Attr speedup: {dt_np_attr/dt_c_attr:.1f}x")
+
+
 def bench_kdtree_new_methods(n):
     print(f"\n=== KDTree: radius_filter + estimate_normals  (N={n:,}) ===")
     from pykdtree.kdtree import KDTree
@@ -206,6 +299,8 @@ if __name__ == "__main__":
     bench_scatter_minmax(N)
     bench_grid_sample(N)
     bench_filter_bbox(N)
+    bench_merge_tiles(20, 100_000)   # 20 tiles × 100K = 2M points
+    bench_merge_tiles(100, 100_000)  # 100 tiles × 100K = 10M points
     bench_kdtree_new_methods(N)
 
     print(f"\n{'='*60}")

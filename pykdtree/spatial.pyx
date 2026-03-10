@@ -24,6 +24,7 @@ tiling, scatter/gather, and spatial filtering.
 import numpy as np
 cimport numpy as np
 from libc.stdint cimport uint64_t, uint32_t, int32_t, uint8_t
+from libc.stdlib cimport malloc, free
 cimport cython
 
 np.import_array()
@@ -75,6 +76,30 @@ cdef extern void filter_points_in_bbox_double(double *points, uint64_t n,
                                               double min_x, double min_y, double min_z,
                                               double max_x, double max_y, double max_z,
                                               uint8_t *mask_out, uint64_t *count_out) nogil
+
+cdef extern void concat_masked(void **data_ptrs, uint8_t **mask_ptrs,
+                                uint64_t *sizes, uint64_t n_arrays,
+                                uint64_t elem_size,
+                                void *out, uint64_t *total_out) nogil
+
+cdef extern void merge_tiles_float(float **tile_x_ptrs, float **tile_y_ptrs,
+                                    float **tile_z_ptrs,
+                                    uint64_t *tile_sizes,
+                                    float *tile_offsets, uint64_t n_tiles,
+                                    float roi_min_x, float roi_min_y,
+                                    float roi_max_x, float roi_max_y,
+                                    int use_roi,
+                                    float *xyz_out, uint8_t **mask_ptrs,
+                                    uint64_t *tile_counts_out, uint64_t *total_out) nogil
+cdef extern void merge_tiles_double(double **tile_x_ptrs, double **tile_y_ptrs,
+                                     double **tile_z_ptrs,
+                                     uint64_t *tile_sizes,
+                                     double *tile_offsets, uint64_t n_tiles,
+                                     double roi_min_x, double roi_min_y,
+                                     double roi_max_x, double roi_max_y,
+                                     int use_roi,
+                                     double *xyz_out, uint8_t **mask_ptrs,
+                                     uint64_t *tile_counts_out, uint64_t *total_out) nogil
 
 
 # ---- Python API ----
@@ -433,3 +458,244 @@ def filter_bbox(np.ndarray points not None,
                                          <uint8_t *>mask.data, &count)
 
     return mask.view(np.bool_), int(count)
+
+
+def merge_tiles(list tiles not None, np.ndarray offsets not None,
+                roi=None):
+    """Merge multiple point cloud tiles with ROI filtering and coordinate transform.
+
+    Fuses ROI masking, coordinate transformation, and concatenation into a
+    single C/OpenMP call, avoiding intermediate arrays.
+
+    Accepts separate x, y, z columns per tile — directly compatible with
+    PyArrow ``.to_numpy()`` output, no ``column_stack`` needed.
+
+    :Parameters:
+    tiles : list of tuples (x, y, z)
+        Each element is a tuple of three 1D numpy arrays (float32 or float64).
+        Can also be (n, 3) arrays for convenience (auto-split into columns).
+    offsets : numpy array, shape (n_tiles, 3)
+        Per-tile offset vectors (tile_origin - target_origin).
+    roi : tuple (min_x, min_y, max_x, max_y) or None
+        ROI bounds in target (scene-local) coordinates.
+        If None, all points are included.
+
+    :Returns:
+    xyz : numpy array, shape (n_total, 3)
+        Merged and transformed point coordinates (interleaved).
+    masks : list of numpy bool arrays
+        Per-tile masks indicating which points survived ROI filtering.
+        Useful for extracting attributes on the Python side.
+    """
+    cdef uint64_t n_tiles = <uint64_t>len(tiles)
+    if n_tiles == 0:
+        return np.empty((0, 3), dtype=np.float32), []
+    if offsets.ndim != 2 or offsets.shape[0] != <int>n_tiles or offsets.shape[1] != 3:
+        raise ValueError('offsets must have shape (n_tiles, 3)')
+
+    # Normalize input: accept (x, y, z) tuples or (n, 3) arrays
+    cdef list tile_x_list = []
+    cdef list tile_y_list = []
+    cdef list tile_z_list = []
+    cdef uint64_t total_max = 0
+
+    for t in range(n_tiles):
+        item = tiles[t]
+        if isinstance(item, np.ndarray) and item.ndim == 2 and item.shape[1] == 3:
+            tile_x_list.append(item[:, 0])
+            tile_y_list.append(item[:, 1])
+            tile_z_list.append(item[:, 2])
+            total_max += item.shape[0]
+        elif isinstance(item, (tuple, list)) and len(item) == 3:
+            tile_x_list.append(np.asarray(item[0]))
+            tile_y_list.append(np.asarray(item[1]))
+            tile_z_list.append(np.asarray(item[2]))
+            total_max += len(item[0])
+        else:
+            raise ValueError(f'tile {t}: expected (x, y, z) tuple or (n, 3) array')
+
+    # Determine dtype from first tile
+    cdef bint is_float32 = (tile_x_list[0].dtype == np.float32)
+
+    # Ensure contiguous + right dtype, store references
+    cdef list cx_list = []
+    cdef list cy_list = []
+    cdef list cz_list = []
+    cdef np.ndarray[uint64_t, ndim=1] sizes = np.empty(n_tiles, dtype=np.uint64)
+
+    for t in range(n_tiles):
+        if is_float32:
+            cx_list.append(np.ascontiguousarray(tile_x_list[t], dtype=np.float32))
+            cy_list.append(np.ascontiguousarray(tile_y_list[t], dtype=np.float32))
+            cz_list.append(np.ascontiguousarray(tile_z_list[t], dtype=np.float32))
+        else:
+            cx_list.append(np.ascontiguousarray(tile_x_list[t], dtype=np.float64))
+            cy_list.append(np.ascontiguousarray(tile_y_list[t], dtype=np.float64))
+            cz_list.append(np.ascontiguousarray(tile_z_list[t], dtype=np.float64))
+        sizes[t] = <uint64_t>len(cx_list[t])
+
+    # Allocate mask arrays
+    cdef list mask_list = []
+    for t in range(n_tiles):
+        mask_list.append(np.empty(sizes[t], dtype=np.uint8))
+
+    # Build C pointer arrays
+    cdef float **xptrs_f = NULL
+    cdef float **yptrs_f = NULL
+    cdef float **zptrs_f = NULL
+    cdef double **xptrs_d = NULL
+    cdef double **yptrs_d = NULL
+    cdef double **zptrs_d = NULL
+    cdef uint8_t **mask_ptrs_c = NULL
+    cdef np.ndarray[uint64_t, ndim=1] counts = np.empty(n_tiles, dtype=np.uint64)
+    cdef uint64_t total_out = 0
+
+    # ROI params
+    cdef int c_use_roi = 1 if roi is not None else 0
+    cdef float c_roi_min_x_f = 0, c_roi_min_y_f = 0, c_roi_max_x_f = 0, c_roi_max_y_f = 0
+    cdef double c_roi_min_x_d = 0, c_roi_min_y_d = 0, c_roi_max_x_d = 0, c_roi_max_y_d = 0
+    if roi is not None:
+        c_roi_min_x_f = <float>roi[0]
+        c_roi_min_y_f = <float>roi[1]
+        c_roi_max_x_f = <float>roi[2]
+        c_roi_max_y_f = <float>roi[3]
+        c_roi_min_x_d = <double>roi[0]
+        c_roi_min_y_d = <double>roi[1]
+        c_roi_max_x_d = <double>roi[2]
+        c_roi_max_y_d = <double>roi[3]
+
+    cdef np.ndarray[float, ndim=1] offsets_f, xyz_out_f, arr_f
+    cdef np.ndarray[double, ndim=1] offsets_d, xyz_out_d, arr_d
+    cdef np.ndarray[uint8_t, ndim=1] mask_arr
+    cdef uint64_t t_idx
+
+    if is_float32:
+        offsets_f = np.ascontiguousarray(offsets.ravel(), dtype=np.float32)
+        xyz_out_f = np.empty(total_max * 3, dtype=np.float32)
+
+        xptrs_f = <float **>malloc(n_tiles * sizeof(float *))
+        yptrs_f = <float **>malloc(n_tiles * sizeof(float *))
+        zptrs_f = <float **>malloc(n_tiles * sizeof(float *))
+        mask_ptrs_c = <uint8_t **>malloc(n_tiles * sizeof(uint8_t *))
+        for t_idx in range(n_tiles):
+            arr_f = cx_list[t_idx]; xptrs_f[t_idx] = <float *>arr_f.data
+            arr_f = cy_list[t_idx]; yptrs_f[t_idx] = <float *>arr_f.data
+            arr_f = cz_list[t_idx]; zptrs_f[t_idx] = <float *>arr_f.data
+            mask_arr = mask_list[t_idx]; mask_ptrs_c[t_idx] = <uint8_t *>mask_arr.data
+
+        with nogil:
+            merge_tiles_float(xptrs_f, yptrs_f, zptrs_f,
+                              <uint64_t *>sizes.data,
+                              <float *>offsets_f.data, n_tiles,
+                              c_roi_min_x_f, c_roi_min_y_f,
+                              c_roi_max_x_f, c_roi_max_y_f,
+                              c_use_roi,
+                              <float *>xyz_out_f.data, mask_ptrs_c,
+                              <uint64_t *>counts.data, &total_out)
+
+        free(xptrs_f); free(yptrs_f); free(zptrs_f); free(mask_ptrs_c)
+        result_xyz = xyz_out_f[:total_out * 3].reshape(total_out, 3)
+    else:
+        offsets_d = np.ascontiguousarray(offsets.ravel(), dtype=np.float64)
+        xyz_out_d = np.empty(total_max * 3, dtype=np.float64)
+
+        xptrs_d = <double **>malloc(n_tiles * sizeof(double *))
+        yptrs_d = <double **>malloc(n_tiles * sizeof(double *))
+        zptrs_d = <double **>malloc(n_tiles * sizeof(double *))
+        mask_ptrs_c = <uint8_t **>malloc(n_tiles * sizeof(uint8_t *))
+        for t_idx in range(n_tiles):
+            arr_d = cx_list[t_idx]; xptrs_d[t_idx] = <double *>arr_d.data
+            arr_d = cy_list[t_idx]; yptrs_d[t_idx] = <double *>arr_d.data
+            arr_d = cz_list[t_idx]; zptrs_d[t_idx] = <double *>arr_d.data
+            mask_arr = mask_list[t_idx]; mask_ptrs_c[t_idx] = <uint8_t *>mask_arr.data
+
+        with nogil:
+            merge_tiles_double(xptrs_d, yptrs_d, zptrs_d,
+                               <uint64_t *>sizes.data,
+                               <double *>offsets_d.data, n_tiles,
+                               c_roi_min_x_d, c_roi_min_y_d,
+                               c_roi_max_x_d, c_roi_max_y_d,
+                               c_use_roi,
+                               <double *>xyz_out_d.data, mask_ptrs_c,
+                               <uint64_t *>counts.data, &total_out)
+
+        free(xptrs_d); free(yptrs_d); free(zptrs_d); free(mask_ptrs_c)
+        result_xyz = xyz_out_d[:total_out * 3].reshape(total_out, 3)
+
+    # Convert masks to bool views
+    result_masks = [mask_list[t][:sizes[t]].view(np.bool_) for t in range(n_tiles)]
+    return result_xyz, result_masks
+
+
+def apply_masks(list arrays not None, list masks not None):
+    """Concatenate arrays keeping only elements where mask is True.
+
+    Applies the masks from :func:`merge_tiles` to attribute columns,
+    producing a single merged array per attribute. Dtype-agnostic
+    (works with float32, float64, uint8, int32, etc.).
+
+    :Parameters:
+    arrays : list of numpy arrays
+        One 1D array per tile for a single attribute column.
+    masks : list of numpy bool arrays
+        Per-tile masks (as returned by :func:`merge_tiles`).
+
+    :Returns:
+    result : numpy array, 1D
+        Concatenated values from all tiles, filtered by masks.
+
+    :Example:
+    >>> xyz, masks = merge_tiles(tiles, offsets, roi=roi)
+    >>> intensity = apply_masks([attrs[i]["intensity"] for i in range(n)], masks)
+    >>> rgb = apply_masks([attrs[i]["rgb"] for i in range(n)], masks)
+    """
+    cdef uint64_t n_arrays = <uint64_t>len(arrays)
+    if n_arrays == 0:
+        return np.empty(0)
+    if len(masks) != <int>n_arrays:
+        raise ValueError('arrays and masks must have the same length')
+
+    # Ensure contiguous, keep references
+    cdef list c_arrays = []
+    cdef list c_masks = []
+    cdef np.ndarray[uint64_t, ndim=1] sizes = np.empty(n_arrays, dtype=np.uint64)
+    cdef uint64_t total_max = 0
+
+    cdef object dtype = arrays[0].dtype
+    cdef uint64_t elem_size = <uint64_t>dtype.itemsize
+
+    for t in range(n_arrays):
+        arr = np.ascontiguousarray(arrays[t])
+        c_arrays.append(arr)
+        m = np.ascontiguousarray(masks[t].view(np.uint8))
+        c_masks.append(m)
+        sizes[t] = <uint64_t>len(arr)
+        total_max += len(arr)
+
+    # Pre-allocate output
+    cdef np.ndarray out = np.empty(total_max, dtype=dtype)
+    cdef uint64_t total_out = 0
+
+    # Build pointer arrays
+    cdef void **data_ptrs_c = <void **>malloc(n_arrays * sizeof(void *))
+    cdef uint8_t **mask_ptrs_c = <uint8_t **>malloc(n_arrays * sizeof(uint8_t *))
+    cdef np.ndarray tmp_arr
+    cdef np.ndarray[uint8_t, ndim=1] tmp_mask
+
+    cdef uint64_t t_idx
+    for t_idx in range(n_arrays):
+        tmp_arr = c_arrays[t_idx]
+        data_ptrs_c[t_idx] = <void *>tmp_arr.data
+        tmp_mask = c_masks[t_idx]
+        mask_ptrs_c[t_idx] = <uint8_t *>tmp_mask.data
+
+    with nogil:
+        concat_masked(data_ptrs_c, mask_ptrs_c,
+                      <uint64_t *>sizes.data, n_arrays,
+                      elem_size,
+                      <void *>out.data, &total_out)
+
+    free(data_ptrs_c)
+    free(mask_ptrs_c)
+
+    return out[:total_out]
