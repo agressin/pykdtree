@@ -148,6 +148,16 @@ cdef extern void sor_mean_dists_double_int32_t(tree_double_int32_t *tree, double
 cdef extern void sor_mean_dists_float_int64_t(tree_float_int64_t *tree, float *pa, uint64_t num_points, uint64_t k, float *mean_dists_out) nogil
 cdef extern void sor_mean_dists_double_int64_t(tree_double_int64_t *tree, double *pa, uint64_t num_points, uint64_t k, double *mean_dists_out) nogil
 
+cdef extern void radius_filter_float_int32_t(tree_float_int32_t *tree, float *pa, uint32_t num_points, uint32_t k_min, float radius, uint8_t *inlier_mask_out, uint32_t *count_out) nogil
+cdef extern void radius_filter_double_int32_t(tree_double_int32_t *tree, double *pa, uint32_t num_points, uint32_t k_min, double radius, uint8_t *inlier_mask_out, uint32_t *count_out) nogil
+cdef extern void radius_filter_float_int64_t(tree_float_int64_t *tree, float *pa, uint64_t num_points, uint64_t k_min, float radius, uint8_t *inlier_mask_out, uint64_t *count_out) nogil
+cdef extern void radius_filter_double_int64_t(tree_double_int64_t *tree, double *pa, uint64_t num_points, uint64_t k_min, double radius, uint8_t *inlier_mask_out, uint64_t *count_out) nogil
+
+cdef extern void estimate_normals_float_int32_t(tree_float_int32_t *tree, float *pa, float *point_coords, uint32_t num_points, uint32_t k, float distance_upper_bound, float eps, uint8_t *mask, float *normals_out, float *curvatures_out) nogil
+cdef extern void estimate_normals_double_int32_t(tree_double_int32_t *tree, double *pa, double *point_coords, uint32_t num_points, uint32_t k, double distance_upper_bound, double eps, uint8_t *mask, double *normals_out, double *curvatures_out) nogil
+cdef extern void estimate_normals_float_int64_t(tree_float_int64_t *tree, float *pa, float *point_coords, uint64_t num_points, uint64_t k, float distance_upper_bound, float eps, uint8_t *mask, float *normals_out, float *curvatures_out) nogil
+cdef extern void estimate_normals_double_int64_t(tree_double_int64_t *tree, double *pa, double *point_coords, uint64_t num_points, uint64_t k, double distance_upper_bound, double eps, uint8_t *mask, double *normals_out, double *curvatures_out) nogil
+
 cdef class KDTree:
     """kd-tree for fast nearest-neighbour lookup.
     The interface is made to resemble the scipy.spatial kd-tree except
@@ -636,6 +646,186 @@ cdef class KDTree:
         inlier_mask = mean_dists < threshold
 
         return inlier_mask, mean_dists, threshold
+
+    def radius_filter(KDTree self, k_min=10, radius=1.0):
+        """Radius-based outlier filter.
+
+        Marks points as inliers if they have at least ``k_min`` neighbors
+        within ``radius``. Useful for removing isolated noise points.
+
+        :Parameters:
+        k_min : int
+            Minimum number of neighbors required within radius
+        radius : float
+            Search radius (Euclidean distance)
+
+        :Returns:
+        inlier_mask : numpy boolean array, shape (n,)
+            True for inlier points
+        n_inliers : int
+            Number of inlier points
+        """
+        if k_min < 1:
+            raise ValueError('k_min must be >= 1')
+        if radius <= 0:
+            raise ValueError('radius must be positive')
+
+        cdef uint64_t num_points = self.n
+        cdef np.ndarray[np.uint8_t, ndim=1] mask = np.empty(num_points, dtype=np.uint8)
+        cdef uint8_t *mask_data = <uint8_t *>mask.data
+        cdef uint32_t count32 = 0
+        cdef uint64_t count64 = 0
+        cdef uint64_t c_k_min = <uint64_t>k_min
+        cdef float c_radius_float = <float>radius
+        cdef double c_radius_double = <double>radius
+
+        if self.data_pts.dtype == np.float32:
+            if self._use_int32_t:
+                with nogil:
+                    radius_filter_float_int32_t(self._kdtree_float_int32_t, self._data_pts_data_float,
+                        <uint32_t>num_points, <uint32_t>c_k_min, c_radius_float, mask_data, &count32)
+                n_inliers = int(count32)
+            else:
+                with nogil:
+                    radius_filter_float_int64_t(self._kdtree_float_int64_t, self._data_pts_data_float,
+                        num_points, c_k_min, c_radius_float, mask_data, &count64)
+                n_inliers = int(count64)
+        else:
+            if self._use_int32_t:
+                with nogil:
+                    radius_filter_double_int32_t(self._kdtree_double_int32_t, self._data_pts_data_double,
+                        <uint32_t>num_points, <uint32_t>c_k_min, c_radius_double, mask_data, &count32)
+                n_inliers = int(count32)
+            else:
+                with nogil:
+                    radius_filter_double_int64_t(self._kdtree_double_int64_t, self._data_pts_data_double,
+                        num_points, c_k_min, c_radius_double, mask_data, &count64)
+                n_inliers = int(count64)
+
+        return mask.view(np.bool_), n_inliers
+
+    def estimate_normals(KDTree self, np.ndarray query_pts not None, k=20, eps=0,
+                         distance_upper_bound=None, mask=None):
+        """Estimate surface normals and curvatures from k-NN neighborhoods.
+
+        Lightweight alternative to compute_descriptors when only normals
+        and curvature are needed. Uses eigendecomposition of the local
+        covariance matrix (Cardano's formula for 3x3).
+
+        Only works for 3D data (ndim=3).
+
+        :Parameters:
+        query_pts : numpy array, shape (m, 3)
+        k : int
+            Number of neighbors
+        eps : non-negative float
+        distance_upper_bound : float, optional
+        mask : numpy array, optional
+
+        :Returns:
+        normals : numpy array, shape (m, 3)
+            Unit normal vectors (oriented upward)
+        curvatures : numpy array, shape (m,)
+            Surface variation: lambda3 / (lambda1 + lambda2 + lambda3)
+        """
+        if self.ndim != 3:
+            raise ValueError('estimate_normals only supports 3D data (ndim=3)')
+        if k < 2:
+            raise ValueError('k must be >= 2')
+        if eps < 0:
+            raise ValueError('eps must be non-negative')
+        if distance_upper_bound is not None and distance_upper_bound < 0:
+            raise ValueError('distance_upper_bound must be non-negative')
+
+        if query_pts.ndim == 1:
+            q_ndim = 1
+        else:
+            q_ndim = query_pts.shape[1]
+        if self.ndim != q_ndim:
+            raise ValueError('Data and query points must have same dimensions')
+        if self.data_pts.dtype == np.float32 and query_pts.dtype != np.float32:
+            raise TypeError('Type mismatch. query points must be of type float32 when data points are of type float32')
+
+        cdef uint64_t num_qpoints = query_pts.shape[0]
+
+        cdef np.ndarray[float, ndim=1] query_array_float
+        cdef np.ndarray[double, ndim=1] query_array_double
+        cdef float *query_data_float
+        cdef double *query_data_double
+
+        cdef np.ndarray[np.uint8_t, ndim=1] query_mask
+        cdef np.uint8_t *query_mask_data
+
+        if mask is not None and mask.size != self.n:
+            raise ValueError('Mask must have the same size as data points')
+        elif mask is not None:
+            query_mask = np.ascontiguousarray(mask.ravel(), dtype=np.uint8)
+            query_mask_data = <uint8_t *>query_mask.data
+        else:
+            query_mask_data = NULL
+
+        cdef float dub_float
+        cdef double dub_double
+        if distance_upper_bound is None:
+            if self.data_pts.dtype == np.float32:
+                dub_float = <float>np.finfo(np.float32).max
+            else:
+                dub_double = <double>np.finfo(np.float64).max
+        else:
+            if self.data_pts.dtype == np.float32:
+                dub_float = <float>(distance_upper_bound * distance_upper_bound)
+            else:
+                dub_double = <double>(distance_upper_bound * distance_upper_bound)
+
+        cdef float epsilon_float = <float>eps
+        cdef double epsilon_double = <double>eps
+        cdef uint64_t c_k = <uint64_t>k
+
+        cdef np.ndarray[float, ndim=1] normals_float
+        cdef np.ndarray[double, ndim=1] normals_double
+        cdef np.ndarray[float, ndim=1] curvatures_float
+        cdef np.ndarray[double, ndim=1] curvatures_double
+
+        if query_pts.dtype == np.float32 and self.data_pts.dtype == np.float32:
+            query_array_float = np.ascontiguousarray(query_pts.ravel(), dtype=np.float32)
+            query_data_float = <float *>query_array_float.data
+            normals_float = np.empty(num_qpoints * 3, dtype=np.float32)
+            curvatures_float = np.empty(num_qpoints, dtype=np.float32)
+
+            if self._use_int32_t:
+                with nogil:
+                    estimate_normals_float_int32_t(self._kdtree_float_int32_t, self._data_pts_data_float,
+                        query_data_float, <uint32_t>num_qpoints, <uint32_t>c_k,
+                        dub_float, epsilon_float, query_mask_data,
+                        <float *>normals_float.data, <float *>curvatures_float.data)
+            else:
+                with nogil:
+                    estimate_normals_float_int64_t(self._kdtree_float_int64_t, self._data_pts_data_float,
+                        query_data_float, num_qpoints, c_k,
+                        dub_float, epsilon_float, query_mask_data,
+                        <float *>normals_float.data, <float *>curvatures_float.data)
+
+            return normals_float.reshape(num_qpoints, 3), curvatures_float
+        else:
+            query_array_double = np.ascontiguousarray(query_pts.ravel(), dtype=np.float64)
+            query_data_double = <double *>query_array_double.data
+            normals_double = np.empty(num_qpoints * 3, dtype=np.float64)
+            curvatures_double = np.empty(num_qpoints, dtype=np.float64)
+
+            if self._use_int32_t:
+                with nogil:
+                    estimate_normals_double_int32_t(self._kdtree_double_int32_t, self._data_pts_data_double,
+                        query_data_double, <uint32_t>num_qpoints, <uint32_t>c_k,
+                        dub_double, epsilon_double, query_mask_data,
+                        <double *>normals_double.data, <double *>curvatures_double.data)
+            else:
+                with nogil:
+                    estimate_normals_double_int64_t(self._kdtree_double_int64_t, self._data_pts_data_double,
+                        query_data_double, num_qpoints, c_k,
+                        dub_double, epsilon_double, query_mask_data,
+                        <double *>normals_double.data, <double *>curvatures_double.data)
+
+            return normals_double.reshape(num_qpoints, 3), curvatures_double
 
     def __dealloc__(KDTree self):
         if self._kdtree_float_int32_t != NULL:

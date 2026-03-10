@@ -112,6 +112,13 @@ void compute_descriptors_multiscale_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tr
                  int32_t *k_scales, int32_t num_scales,
                  ${DTYPE} distance_upper_bound, ${DTYPE} eps, uint8_t *mask,
                  ${DTYPE} *descriptors_out);
+void radius_filter_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa,
+                 u${ITYPE} num_points, u${ITYPE} k_min, ${DTYPE} radius,
+                 uint8_t *inlier_mask_out, u${ITYPE} *count_out);
+void estimate_normals_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa,
+                 ${DTYPE} *point_coords, u${ITYPE} num_points, u${ITYPE} k,
+                 ${DTYPE} distance_upper_bound, ${DTYPE} eps, uint8_t *mask,
+                 ${DTYPE} *normals_out, ${DTYPE} *curvatures_out);
 
 % endfor
 % endfor
@@ -1156,6 +1163,207 @@ void compute_descriptors_multiscale_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tr
                 for (f = 0; f < NUM_DESCRIPTORS; f++)
                     descriptors_out[out_off + f] = 0;
                 descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+            }
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
+Radius-based outlier filter.
+Queries k_min neighbors for each point. If the k_min-th
+neighbor is beyond radius, the point is marked as outlier.
+Params:
+    tree : Tree struct
+    pa : data points (also query points)
+    num_points : number of points
+    k_min : minimum number of neighbors required within radius
+    radius : search radius (Euclidean)
+    inlier_mask_out : (num_points,) output, 1 = inlier
+    count_out : number of inliers (return, may be NULL)
+************************************************/
+void radius_filter_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa,
+                 u${ITYPE} num_points, u${ITYPE} k_min, ${DTYPE} radius,
+                 uint8_t *inlier_mask_out, u${ITYPE} *count_out)
+{
+    int8_t no_dims = tree->no_dims;
+    ${DTYPE} *bbox = tree->bbox;
+    u${ITYPE} *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    /* Query k_min+1 to include self */
+    u${ITYPE} k_total = k_min + 1;
+    int64_t local_k_total = (int64_t) k_total;
+    ${DTYPE} radius_sq = radius * radius;
+    Node_${DTYPE}_${ITYPE} *root = (Node_${DTYPE}_${ITYPE} *)tree->root;
+    u${ITYPE} total_inliers = 0;
+
+    #pragma omp parallel
+    {
+        u${ITYPE} *local_idx = (u${ITYPE} *)malloc(k_total * sizeof(u${ITYPE}));
+        ${DTYPE} *local_dist = (${DTYPE} *)malloc(k_total * sizeof(${DTYPE}));
+        u${ITYPE} thread_inliers = 0;
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            ${DTYPE} min_dist;
+            u${ITYPE} count;
+
+            for (j = 0; j < local_k_total; j++)
+            {
+                local_idx[j] = IDX_MAX_${ITYPE};
+                local_dist[j] = DIST_MAX_${DTYPE};
+            }
+
+            min_dist = get_min_dist_${DTYPE}(pa + no_dims * i, no_dims, bbox);
+            search_splitnode_${DTYPE}_${ITYPE}(root, pa, pidx, no_dims,
+                             pa + no_dims * i, min_dist,
+                             k_total, radius_sq, (${DTYPE})1.0, NULL,
+                             local_idx, local_dist);
+
+            /* Count valid neighbors (excluding self at index 0) */
+            count = 0;
+            for (j = 1; j < local_k_total; j++)
+            {
+                if (local_dist[j] < radius_sq && local_idx[j] != IDX_MAX_${ITYPE})
+                    count++;
+            }
+
+            if (count >= k_min)
+            {
+                inlier_mask_out[i] = 1;
+                thread_inliers++;
+            }
+            else
+            {
+                inlier_mask_out[i] = 0;
+            }
+        }
+
+        #pragma omp atomic
+        total_inliers += thread_inliers;
+
+        free(local_idx);
+        free(local_dist);
+    }
+
+    if (count_out) *count_out = total_inliers;
+}
+
+/************************************************
+Estimate normals and curvatures from k-NN neighborhoods.
+Lightweight alternative to compute_descriptors when only
+normals and curvature are needed.
+Params:
+    tree : Tree struct
+    pa : data points
+    point_coords : query points (n * 3)
+    num_points : number of query points
+    k : number of neighbors
+    distance_upper_bound : max distance
+    eps : approximation factor
+    mask : point validity mask (may be NULL)
+    normals_out : (num_points * 3) output normals
+    curvatures_out : (num_points,) output curvatures (surface variation)
+************************************************/
+void estimate_normals_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa,
+                 ${DTYPE} *point_coords, u${ITYPE} num_points, u${ITYPE} k,
+                 ${DTYPE} distance_upper_bound, ${DTYPE} eps, uint8_t *mask,
+                 ${DTYPE} *normals_out, ${DTYPE} *curvatures_out)
+{
+    ${DTYPE} eps_fac = 1 / ((1 + eps) * (1 + eps));
+    int8_t no_dims = tree->no_dims;
+    ${DTYPE} *bbox = tree->bbox;
+    u${ITYPE} *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    int64_t local_k = (int64_t) k;
+    Node_${DTYPE}_${ITYPE} *root = (Node_${DTYPE}_${ITYPE} *)tree->root;
+
+    #pragma omp parallel
+    {
+        u${ITYPE} *local_idx = (u${ITYPE} *)malloc(k * sizeof(u${ITYPE}));
+        ${DTYPE} *local_dist = (${DTYPE} *)malloc(k * sizeof(${DTYPE}));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            ${DTYPE} min_dist;
+            ${DTYPE} sum_x, sum_y, sum_z;
+            ${DTYPE} sum_xx, sum_xy, sum_xz, sum_yy, sum_yz, sum_zz;
+            ${DTYPE} *pt;
+            ${DTYPE} px, py, pz;
+            int64_t valid_count;
+
+            /* Initialize */
+            for (j = 0; j < local_k; j++)
+            {
+                local_idx[j] = IDX_MAX_${ITYPE};
+                local_dist[j] = DIST_MAX_${DTYPE};
+            }
+
+            /* Query k neighbors */
+            min_dist = get_min_dist_${DTYPE}(point_coords + no_dims * i, no_dims, bbox);
+            search_splitnode_${DTYPE}_${ITYPE}(root, pa, pidx, no_dims,
+                             point_coords + no_dims * i, min_dist,
+                             k, distance_upper_bound, eps_fac, mask,
+                             local_idx, local_dist);
+
+            /* Accumulate covariance sums */
+            sum_x = sum_y = sum_z = 0;
+            sum_xx = sum_xy = sum_xz = sum_yy = sum_yz = sum_zz = 0;
+            valid_count = 0;
+
+            for (j = 0; j < local_k; j++)
+            {
+                if (local_idx[j] == IDX_MAX_${ITYPE} || local_dist[j] >= DIST_MAX_${DTYPE})
+                    break;
+                pt = pa + no_dims * local_idx[j];
+                px = pt[0]; py = pt[1]; pz = pt[2];
+                sum_x += px; sum_y += py; sum_z += pz;
+                sum_xx += px * px; sum_xy += px * py; sum_xz += px * pz;
+                sum_yy += py * py; sum_yz += py * pz; sum_zz += pz * pz;
+                valid_count++;
+            }
+
+            if (valid_count < 2)
+            {
+                normals_out[3 * i]     = 0;
+                normals_out[3 * i + 1] = 0;
+                normals_out[3 * i + 2] = 1;
+                curvatures_out[i] = 0;
+            }
+            else
+            {
+                ${DTYPE} inv_k = 1 / (${DTYPE})valid_count;
+                ${DTYPE} mx = sum_x * inv_k, my = sum_y * inv_k, mz = sum_z * inv_k;
+                ${DTYPE} cov_xx = sum_xx * inv_k - mx * mx;
+                ${DTYPE} cov_xy = sum_xy * inv_k - mx * my;
+                ${DTYPE} cov_xz = sum_xz * inv_k - mx * mz;
+                ${DTYPE} cov_yy = sum_yy * inv_k - my * my;
+                ${DTYPE} cov_yz = sum_yz * inv_k - my * mz;
+                ${DTYPE} cov_zz = sum_zz * inv_k - mz * mz;
+
+                ${DTYPE} evals[3], normal[3];
+                eigen_symmetric_3x3_${DTYPE}(cov_xx, cov_xy, cov_xz,
+                                             cov_yy, cov_yz, cov_zz,
+                                             evals, normal);
+
+                /* Orient normal upward */
+                if (normal[2] < 0) { normal[0] = -normal[0]; normal[1] = -normal[1]; normal[2] = -normal[2]; }
+
+                normals_out[3 * i]     = normal[0];
+                normals_out[3 * i + 1] = normal[1];
+                normals_out[3 * i + 2] = normal[2];
+
+                /* Curvature = surface variation = l3 / (l1 + l2 + l3) */
+                {
+                    ${DTYPE} sum_eig = evals[0] + evals[1] + evals[2];
+                    curvatures_out[i] = sum_eig > (${DTYPE})1e-30 ? evals[2] / sum_eig : 0;
+                }
             }
         }
 

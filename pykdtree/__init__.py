@@ -2,6 +2,7 @@
 
 try:
     from . import kdtree
+    from . import spatial
 except ImportError as err:
     raise ImportError(
         "Pykdtree failed to import its C extension. This usually means it "

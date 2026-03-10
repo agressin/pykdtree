@@ -66,8 +66,9 @@ class build_ext_subclass(build_ext):
             # Add support for more compilers here
             raise ValueError('Compiler flags undefined for %s. Please modify setup.py and add compiler flags'
                              % comp)
-        self.extensions[0].extra_compile_args = extra_compile_args
-        self.extensions[0].extra_link_args = extra_link_args
+        for ext in self.extensions:
+            ext.extra_compile_args = extra_compile_args
+            ext.extra_link_args = extra_link_args
         build_ext.build_extensions(self)
 
 
@@ -188,6 +189,11 @@ with open('README.rst', 'r') as readme_file:
 
 extensions = [
     Extension('pykdtree.kdtree', sources=['pykdtree/kdtree.pyx', 'pykdtree/_kdtree_core.c'],
+              include_dirs=[np.get_include()],
+              define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_25_API_VERSION")],
+              cython_directives={"language_level": "3", "freethreading_compatible": True},
+              ),
+    Extension('pykdtree.spatial', sources=['pykdtree/spatial.pyx', 'pykdtree/_spatial_ops.c'],
               include_dirs=[np.get_include()],
               define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_25_API_VERSION")],
               cython_directives={"language_level": "3", "freethreading_compatible": True},
