@@ -990,40 +990,42 @@ class PredictionAccumulator:
     def __init__(self, int n_points, str output_type='classes',
                  n_classes=None, str strategy='center',
                  default_value=-1):
+        # Validate strategy
+        if strategy not in ('center', 'mean', 'vote'):
+            raise ValueError(f"strategy must be 'center', 'mean', or 'vote', got '{strategy}'")
+        if output_type not in ('classes', 'logits', 'probas'):
+            raise ValueError(f"output_type must be 'classes', 'logits', or 'probas', got '{output_type}'")
+
         self.n_points = n_points
         self.output_type = output_type
         self.n_classes = n_classes if n_classes is not None else 0
         self.strategy = strategy
         self.default_value = default_value
 
-        cdef int strat_id = 0
-        if strategy == 'mean':
+        cdef int strat_id
+        if strategy == 'center':
+            strat_id = 0
+        elif strategy == 'mean':
             strat_id = 1
-        elif strategy == 'vote':
+        else:  # vote
             strat_id = 2
         self._strategy_id = strat_id
 
-        # Allocate accumulators — init all to None to avoid AttributeError
-        self._acc_preds = None
-        self._acc_weights = None
-        self._acc_votes = None
-        self._acc_has_pred = None
-        self._acc_sum = None
-
-        if output_type == 'classes':
+        # Allocate accumulators based on strategy
+        if strat_id == 0:  # center: classes with max-weight tracking
             self._acc_preds = np.full(n_points, default_value, dtype=np.int32)
-            if strategy == 'center':
-                self._acc_weights = np.zeros(n_points, dtype=np.float32)
-            else:  # vote
-                if n_classes is None or n_classes <= 0:
-                    raise ValueError('n_classes required for vote strategy')
-                self._acc_votes = np.zeros((n_points, self.n_classes), dtype=np.float32)
-                self._acc_has_pred = np.zeros(n_points, dtype=np.uint8)
-        else:  # logits/probas
+            self._acc_weights = np.zeros(n_points, dtype=np.float32)
+        elif strat_id == 1:  # mean: weighted sum of logits/probas
             if n_classes is None or n_classes <= 0:
                 raise ValueError(f'n_classes required for {output_type}')
             self._acc_sum = np.zeros((n_points, self.n_classes), dtype=np.float32)
             self._acc_weights = np.zeros(n_points, dtype=np.float32)
+        else:  # vote: weighted class voting
+            if n_classes is None or n_classes <= 0:
+                raise ValueError('n_classes required for vote strategy')
+            self._acc_preds = np.full(n_points, default_value, dtype=np.int32)
+            self._acc_votes = np.zeros((n_points, self.n_classes), dtype=np.float32)
+            self._acc_has_pred = np.zeros(n_points, dtype=np.uint8)
 
     def add(self, np.ndarray row_ids not None,
             np.ndarray predictions not None,
