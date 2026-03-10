@@ -1003,17 +1003,22 @@ class PredictionAccumulator:
             strat_id = 2
         self._strategy_id = strat_id
 
-        # Allocate accumulators
+        # Allocate accumulators — init all to None to avoid AttributeError
+        self._acc_preds = None
+        self._acc_weights = None
+        self._acc_votes = None
+        self._acc_has_pred = None
+        self._acc_sum = None
+
         if output_type == 'classes':
+            self._acc_preds = np.full(n_points, default_value, dtype=np.int32)
             if strategy == 'center':
-                self._acc_preds = np.full(n_points, default_value, dtype=np.int32)
                 self._acc_weights = np.zeros(n_points, dtype=np.float32)
             else:  # vote
                 if n_classes is None or n_classes <= 0:
                     raise ValueError('n_classes required for vote strategy')
                 self._acc_votes = np.zeros((n_points, self.n_classes), dtype=np.float32)
                 self._acc_has_pred = np.zeros(n_points, dtype=np.uint8)
-                self._acc_preds = np.full(n_points, default_value, dtype=np.int32)
         else:  # logits/probas
             if n_classes is None or n_classes <= 0:
                 raise ValueError(f'n_classes required for {output_type}')
@@ -1040,16 +1045,16 @@ class PredictionAccumulator:
         cdef np.ndarray[uint64_t, ndim=1] rids = np.ascontiguousarray(row_ids, dtype=np.uint64)
         cdef np.ndarray[float, ndim=1] w = np.ascontiguousarray(weights, dtype=np.float32)
 
-        cdef np.ndarray[int32_t, ndim=1] preds_i
-        cdef np.ndarray[float, ndim=1] preds_f
+        cdef np.ndarray preds_i
+        cdef np.ndarray preds_f
         cdef int32_t *preds_int_ptr = NULL
         cdef float *preds_float_ptr = NULL
 
-        cdef np.ndarray[int32_t, ndim=1] acc_preds_arr
-        cdef np.ndarray[float, ndim=1] acc_weights_arr
-        cdef np.ndarray[float, ndim=1] acc_sum_arr
-        cdef np.ndarray[float, ndim=1] acc_votes_arr
-        cdef np.ndarray[uint8_t, ndim=1] acc_has_arr
+        cdef np.ndarray acc_preds_arr
+        cdef np.ndarray acc_weights_arr
+        cdef np.ndarray acc_sum_arr
+        cdef np.ndarray acc_votes_arr
+        cdef np.ndarray acc_has_arr
 
         cdef int32_t *acc_preds_ptr = NULL
         cdef float *acc_w_ptr = NULL
