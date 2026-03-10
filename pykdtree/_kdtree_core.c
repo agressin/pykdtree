@@ -27,6 +27,13 @@ Anne M. Archibald and libANN by David M. Mount and Sunil Arya.
 #include <stdlib.h>
 #include <stdint.h>
 #include <float.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define NUM_DESCRIPTORS 20
 
 #define PA(i,d)			(pa[no_dims * pidx[i] + d])
 #define PASWAP_int32_t(a,b) { uint32_t tmp = pidx[a]; pidx[a] = pidx[b]; pidx[b] = tmp; }
@@ -130,6 +137,9 @@ typedef struct
 float calc_dist_float(float *point1_coord, float *point2_coord, int8_t no_dims);
 float get_cube_offset_float(int8_t dim, float *point_coord, float *bbox);
 float get_min_dist_float(float *point_coord, int8_t no_dims, float *bbox);
+void eigen_symmetric_3x3_float(float cov_xx, float cov_xy, float cov_xz,
+                                   float cov_yy, float cov_yz, float cov_zz,
+                                   float *evals, float *normal);
 
 
 void insert_point_float_int32_t(uint32_t *closest_idx, float *closest_dist, uint32_t pidx, float cur_dist, uint32_t k);
@@ -151,6 +161,13 @@ void search_splitnode_float_int32_t(Node_float_int32_t *root, float *pa, uint32_
 void search_tree_float_int32_t(Tree_float_int32_t *tree, float *pa, float *point_coords,
                  uint32_t num_points, uint32_t k,  float distance_upper_bound,
                  float eps, uint8_t *mask, uint32_t *closest_idxs, float *closest_dists);
+void sor_mean_dists_float_int32_t(Tree_float_int32_t *tree, float *pa,
+                 uint32_t num_points, uint32_t k, float *mean_dists_out);
+void compute_descriptors_multiscale_float_int32_t(Tree_float_int32_t *tree, float *pa, float *point_coords,
+                 uint32_t num_points, uint32_t k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 float distance_upper_bound, float eps, uint8_t *mask,
+                 float *descriptors_out);
 
 
 void insert_point_float_int64_t(uint64_t *closest_idx, float *closest_dist, uint64_t pidx, float cur_dist, uint64_t k);
@@ -172,11 +189,21 @@ void search_splitnode_float_int64_t(Node_float_int64_t *root, float *pa, uint64_
 void search_tree_float_int64_t(Tree_float_int64_t *tree, float *pa, float *point_coords,
                  uint64_t num_points, uint64_t k,  float distance_upper_bound,
                  float eps, uint8_t *mask, uint64_t *closest_idxs, float *closest_dists);
+void sor_mean_dists_float_int64_t(Tree_float_int64_t *tree, float *pa,
+                 uint64_t num_points, uint64_t k, float *mean_dists_out);
+void compute_descriptors_multiscale_float_int64_t(Tree_float_int64_t *tree, float *pa, float *point_coords,
+                 uint64_t num_points, uint64_t k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 float distance_upper_bound, float eps, uint8_t *mask,
+                 float *descriptors_out);
 
 
 double calc_dist_double(double *point1_coord, double *point2_coord, int8_t no_dims);
 double get_cube_offset_double(int8_t dim, double *point_coord, double *bbox);
 double get_min_dist_double(double *point_coord, int8_t no_dims, double *bbox);
+void eigen_symmetric_3x3_double(double cov_xx, double cov_xy, double cov_xz,
+                                   double cov_yy, double cov_yz, double cov_zz,
+                                   double *evals, double *normal);
 
 
 void insert_point_double_int32_t(uint32_t *closest_idx, double *closest_dist, uint32_t pidx, double cur_dist, uint32_t k);
@@ -198,6 +225,13 @@ void search_splitnode_double_int32_t(Node_double_int32_t *root, double *pa, uint
 void search_tree_double_int32_t(Tree_double_int32_t *tree, double *pa, double *point_coords,
                  uint32_t num_points, uint32_t k,  double distance_upper_bound,
                  double eps, uint8_t *mask, uint32_t *closest_idxs, double *closest_dists);
+void sor_mean_dists_double_int32_t(Tree_double_int32_t *tree, double *pa,
+                 uint32_t num_points, uint32_t k, double *mean_dists_out);
+void compute_descriptors_multiscale_double_int32_t(Tree_double_int32_t *tree, double *pa, double *point_coords,
+                 uint32_t num_points, uint32_t k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 double distance_upper_bound, double eps, uint8_t *mask,
+                 double *descriptors_out);
 
 
 void insert_point_double_int64_t(uint64_t *closest_idx, double *closest_dist, uint64_t pidx, double cur_dist, uint64_t k);
@@ -219,6 +253,13 @@ void search_splitnode_double_int64_t(Node_double_int64_t *root, double *pa, uint
 void search_tree_double_int64_t(Tree_double_int64_t *tree, double *pa, double *point_coords,
                  uint64_t num_points, uint64_t k,  double distance_upper_bound,
                  double eps, uint8_t *mask, uint64_t *closest_idxs, double *closest_dists);
+void sor_mean_dists_double_int64_t(Tree_double_int64_t *tree, double *pa,
+                 uint64_t num_points, uint64_t k, double *mean_dists_out);
+void compute_descriptors_multiscale_double_int64_t(Tree_double_int64_t *tree, double *pa, double *point_coords,
+                 uint64_t num_points, uint64_t k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 double distance_upper_bound, double eps, uint8_t *mask,
+                 double *descriptors_out);
 
 
 
@@ -288,6 +329,114 @@ float get_min_dist_float(float *point_coord, int8_t no_dims, float *bbox)
     }
 
     return cube_offset;
+}
+
+/************************************************
+Eigendecomposition of 3x3 symmetric matrix using Cardano's formula.
+Eigenvalues returned sorted: evals[0] >= evals[1] >= evals[2].
+Normal is the eigenvector of the smallest eigenvalue.
+Params:
+    cov_xx..cov_zz : upper triangle of symmetric matrix
+    evals : eigenvalues output (3 values)
+    normal : eigenvector of smallest eigenvalue (3 values)
+************************************************/
+void eigen_symmetric_3x3_float(float cov_xx, float cov_xy, float cov_xz,
+                                   float cov_yy, float cov_yz, float cov_zz,
+                                   float *evals, float *normal)
+{
+    float e1, e2, e3;
+    float p1 = cov_xy * cov_xy + cov_xz * cov_xz + cov_yz * cov_yz;
+    float q = (cov_xx + cov_yy + cov_zz) / 3;
+    float p2 = (cov_xx - q) * (cov_xx - q) + (cov_yy - q) * (cov_yy - q) +
+                  (cov_zz - q) * (cov_zz - q) + 2 * p1;
+    float p = sqrt(p2 / 6);
+
+    if (p < (float)1e-30)
+    {
+        /* All eigenvalues are equal */
+        e1 = e2 = e3 = q;
+    }
+    else
+    {
+        float inv_p = 1 / p;
+        /* B = (1/p)(M - q*I) */
+        float b00 = inv_p * (cov_xx - q);
+        float b01 = inv_p * cov_xy;
+        float b02 = inv_p * cov_xz;
+        float b11 = inv_p * (cov_yy - q);
+        float b12 = inv_p * cov_yz;
+        float b22 = inv_p * (cov_zz - q);
+
+        /* det(B) / 2 */
+        float r = (b00 * (b11 * b22 - b12 * b12)
+                     - b01 * (b01 * b22 - b12 * b02)
+                     + b02 * (b01 * b12 - b11 * b02)) / 2;
+
+        /* Clamp for numerical stability */
+        if (r <= -1) r = -1;
+        else if (r >= 1) r = 1;
+
+        float phi = acos(r) / 3;
+
+        e1 = q + 2 * p * cos(phi);
+        e3 = q + 2 * p * cos(phi + 2 * M_PI / 3);
+        e2 = 3 * q - e1 - e3;
+    }
+
+    /* Clamp negative eigenvalues to zero */
+    if (e1 < 0) e1 = 0;
+    if (e2 < 0) e2 = 0;
+    if (e3 < 0) e3 = 0;
+
+    evals[0] = e1;
+    evals[1] = e2;
+    evals[2] = e3;
+
+    /* Compute normal: eigenvector of smallest eigenvalue e3 */
+    /* Form rows of (M - e3*I) */
+    float r0x = cov_xx - e3, r0y = cov_xy,       r0z = cov_xz;
+    float r1x = cov_xy,       r1y = cov_yy - e3, r1z = cov_yz;
+    float r2x = cov_xz,       r2y = cov_yz,       r2z = cov_zz - e3;
+
+    /* Cross products of all row pairs, pick largest */
+    float nx, ny, nz, len_sq, best_len_sq;
+    float cx, cy, cz;
+
+    /* r0 x r1 */
+    nx = r0y * r1z - r0z * r1y;
+    ny = r0z * r1x - r0x * r1z;
+    nz = r0x * r1y - r0y * r1x;
+    best_len_sq = nx * nx + ny * ny + nz * nz;
+
+    /* r0 x r2 */
+    cx = r0y * r2z - r0z * r2y;
+    cy = r0z * r2x - r0x * r2z;
+    cz = r0x * r2y - r0y * r2x;
+    len_sq = cx * cx + cy * cy + cz * cz;
+    if (len_sq > best_len_sq) { nx = cx; ny = cy; nz = cz; best_len_sq = len_sq; }
+
+    /* r1 x r2 */
+    cx = r1y * r2z - r1z * r2y;
+    cy = r1z * r2x - r1x * r2z;
+    cz = r1x * r2y - r1y * r2x;
+    len_sq = cx * cx + cy * cy + cz * cz;
+    if (len_sq > best_len_sq) { nx = cx; ny = cy; nz = cz; best_len_sq = len_sq; }
+
+    /* Normalize */
+    if (best_len_sq > (float)1e-30)
+    {
+        float inv_len = 1 / sqrt(best_len_sq);
+        normal[0] = nx * inv_len;
+        normal[1] = ny * inv_len;
+        normal[2] = nz * inv_len;
+    }
+    else
+    {
+        /* Degenerate case */
+        normal[0] = 0;
+        normal[1] = 0;
+        normal[2] = 1;
+    }
 }
 
 
@@ -864,6 +1013,302 @@ void search_tree_float_int32_t(Tree_float_int32_t *tree, float *pa, float *point
 }
 
 /************************************************
+Compute mean k-NN Euclidean distances for Statistical Outlier Removal.
+Self-queries data points, skips closest neighbor (self), computes
+mean Euclidean distance to k remaining neighbors.
+Params:
+    tree : Tree struct of kd tree
+    pa : data points (also used as query points)
+    num_points : number of data points
+    k : number of neighbors (excluding self)
+    mean_dists_out : mean distances output, shape (num_points,)
+************************************************/
+void sor_mean_dists_float_int32_t(Tree_float_int32_t *tree, float *pa,
+                 uint32_t num_points, uint32_t k, float *mean_dists_out)
+{
+    int8_t no_dims = tree->no_dims;
+    float *bbox = tree->bbox;
+    uint32_t *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    uint32_t k_total = k + 1;  /* +1 to include self */
+    int64_t local_k_total = (int64_t) k_total;
+    Node_float_int32_t *root = (Node_float_int32_t *)tree->root;
+
+    #pragma omp parallel
+    {
+        uint32_t *local_idx = (uint32_t *)malloc(k_total * sizeof(uint32_t));
+        float *local_dist = (float *)malloc(k_total * sizeof(float));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            float min_dist, sum;
+            int64_t count;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_total; j++)
+            {
+                local_idx[j] = IDX_MAX_int32_t;
+                local_dist[j] = DIST_MAX_float;
+            }
+
+            /* Query k+1 neighbors (includes self) */
+            min_dist = get_min_dist_float(pa + no_dims * i, no_dims, bbox);
+            search_splitnode_float_int32_t(root, pa, pidx, no_dims,
+                             pa + no_dims * i, min_dist,
+                             k_total, DIST_MAX_float, (float)1.0, NULL,
+                             local_idx, local_dist);
+
+            /* Mean Euclidean distance, skipping closest (self, index 0) */
+            sum = 0;
+            count = 0;
+            for (j = 1; j < local_k_total; j++)
+            {
+                if (local_dist[j] < DIST_MAX_float)
+                {
+                    sum += sqrt(local_dist[j]);
+                    count++;
+                }
+            }
+            mean_dists_out[i] = (count > 0) ? sum / (float)count : 0;
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
+Compute comprehensive point descriptors in a single k-NN pass.
+Outputs NUM_DESCRIPTORS (20) features per point per scale:
+  0-2: eigenvalues (lambda1 >= lambda2 >= lambda3)
+  3-5: normal vector (nx, ny, nz)
+  6:   verticality (1 - |nz|)
+  7:   linearity = (l1 - l2) / l1
+  8:   planarity = (l2 - l3) / l1
+  9:   sphericity = l3 / l1
+  10:  omnivariance = (l1*l2*l3)^(1/3)
+  11:  anisotropy = (l1 - l3) / l1
+  12:  eigenentropy = -sum(li/S * ln(li/S))
+  13:  surface_variation = l3 / (l1+l2+l3)
+  14:  z_range (z_max - z_min of neighbors)
+  15:  z_above (max_z_neighbor - query_z)
+  16:  z_below (query_z - min_z_neighbor)
+  17:  z_std (height standard deviation of neighbors)
+  18:  density (k / bounding_box_volume)
+  19:  roughness (|point-to-plane distance|)
+k_scales must be sorted ascending.
+************************************************/
+void compute_descriptors_multiscale_float_int32_t(Tree_float_int32_t *tree, float *pa, float *point_coords,
+                 uint32_t num_points, uint32_t k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 float distance_upper_bound, float eps, uint8_t *mask,
+                 float *descriptors_out)
+{
+    float eps_fac = 1 / ((1 + eps) * (1 + eps));
+    int8_t no_dims = tree->no_dims;
+    float *bbox = tree->bbox;
+    uint32_t *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    int64_t local_k_max = (int64_t) k_max;
+    Node_float_int32_t *root = (Node_float_int32_t *)tree->root;
+
+    #pragma omp parallel
+    {
+        uint32_t *local_idx = (uint32_t *)malloc(k_max * sizeof(uint32_t));
+        float *local_dist = (float *)malloc(k_max * sizeof(float));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            float min_dist;
+            int32_t s, scale_idx;
+            float sum_x, sum_y, sum_z;
+            float sum_xx, sum_xy, sum_xz, sum_yy, sum_yz, sum_zz;
+            float bb_min_x, bb_min_y, bb_min_z, bb_max_x, bb_max_y, bb_max_z;
+            float *pt;
+            float px, py, pz;
+            float qx = point_coords[no_dims * i];
+            float qy = point_coords[no_dims * i + 1];
+            float qz = point_coords[no_dims * i + 2];
+            int64_t out_base = (int64_t)i * num_scales * NUM_DESCRIPTORS;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_max; j++)
+            {
+                local_idx[j] = IDX_MAX_int32_t;
+                local_dist[j] = DIST_MAX_float;
+            }
+
+            /* Query k_max neighbors */
+            min_dist = get_min_dist_float(point_coords + no_dims * i, no_dims, bbox);
+            search_splitnode_float_int32_t(root, pa, pidx, no_dims,
+                             point_coords + no_dims * i, min_dist,
+                             k_max, distance_upper_bound, eps_fac, mask,
+                             local_idx, local_dist);
+
+            /* Initialize accumulators */
+            sum_x = sum_y = sum_z = 0;
+            sum_xx = sum_xy = sum_xz = sum_yy = sum_yz = sum_zz = 0;
+            bb_min_x = bb_min_y = bb_min_z = DIST_MAX_float;
+            bb_max_x = bb_max_y = bb_max_z = -DIST_MAX_float;
+            scale_idx = 0;
+
+            for (j = 0; j < local_k_max && scale_idx < num_scales; j++)
+            {
+                if (local_idx[j] == IDX_MAX_int32_t || local_dist[j] >= DIST_MAX_float)
+                    break;
+
+                pt = pa + no_dims * local_idx[j];
+                px = pt[0]; py = pt[1]; pz = pt[2];
+
+                /* Accumulate sums for covariance */
+                sum_x += px; sum_y += py; sum_z += pz;
+                sum_xx += px * px; sum_xy += px * py; sum_xz += px * pz;
+                sum_yy += py * py; sum_yz += py * pz; sum_zz += pz * pz;
+
+                /* Update bounding box */
+                if (px < bb_min_x) bb_min_x = px;
+                if (px > bb_max_x) bb_max_x = px;
+                if (py < bb_min_y) bb_min_y = py;
+                if (py > bb_max_y) bb_max_y = py;
+                if (pz < bb_min_z) bb_min_z = pz;
+                if (pz > bb_max_z) bb_max_z = pz;
+
+                /* At each scale boundary, compute all descriptors */
+                if ((int32_t)(j + 1) == k_scales[scale_idx])
+                {
+                    int64_t out_off = out_base + (int64_t)scale_idx * NUM_DESCRIPTORS;
+                    float evals[3], normal[3];
+
+                    if (j + 1 < 2)
+                    {
+                        for (s = 0; s < NUM_DESCRIPTORS; s++)
+                            descriptors_out[out_off + s] = 0;
+                        descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+                    }
+                    else
+                    {
+                        float inv_k = 1 / (float)(j + 1);
+                        float mx = sum_x * inv_k;
+                        float my = sum_y * inv_k;
+                        float mz = sum_z * inv_k;
+
+                        float cov_xx = sum_xx * inv_k - mx * mx;
+                        float cov_xy = sum_xy * inv_k - mx * my;
+                        float cov_xz = sum_xz * inv_k - mx * mz;
+                        float cov_yy = sum_yy * inv_k - my * my;
+                        float cov_yz = sum_yz * inv_k - my * mz;
+                        float cov_zz = sum_zz * inv_k - mz * mz;
+
+                        eigen_symmetric_3x3_float(cov_xx, cov_xy, cov_xz,
+                                                     cov_yy, cov_yz, cov_zz,
+                                                     evals, normal);
+
+                        /* 0-2: eigenvalues */
+                        descriptors_out[out_off + 0] = evals[0];
+                        descriptors_out[out_off + 1] = evals[1];
+                        descriptors_out[out_off + 2] = evals[2];
+
+                        /* 3-5: normal */
+                        descriptors_out[out_off + 3] = normal[0];
+                        descriptors_out[out_off + 4] = normal[1];
+                        descriptors_out[out_off + 5] = normal[2];
+
+                        /* 6: verticality = 1 - |nz| */
+                        descriptors_out[out_off + 6] = 1 - (normal[2] >= 0 ? normal[2] : -normal[2]);
+
+                        /* 7-13: derived eigenvalue features */
+                        {
+                            float sum_eig = evals[0] + evals[1] + evals[2];
+                            float inv_l1 = evals[0] > (float)1e-30 ? 1 / evals[0] : 0;
+                            float inv_sum = sum_eig > (float)1e-30 ? 1 / sum_eig : 0;
+
+                            /* 7: linearity = (l1 - l2) / l1 */
+                            descriptors_out[out_off + 7] = (evals[0] - evals[1]) * inv_l1;
+
+                            /* 8: planarity = (l2 - l3) / l1 */
+                            descriptors_out[out_off + 8] = (evals[1] - evals[2]) * inv_l1;
+
+                            /* 9: sphericity = l3 / l1 */
+                            descriptors_out[out_off + 9] = evals[2] * inv_l1;
+
+                            /* 10: omnivariance = (l1 * l2 * l3)^(1/3) */
+                            {
+                                float prod = evals[0] * evals[1] * evals[2];
+                                descriptors_out[out_off + 10] = prod > 0 ? cbrt(prod) : 0;
+                            }
+
+                            /* 11: anisotropy = (l1 - l3) / l1 */
+                            descriptors_out[out_off + 11] = (evals[0] - evals[2]) * inv_l1;
+
+                            /* 12: eigenentropy = -sum(li/S * ln(li/S)) */
+                            {
+                                float entropy = 0;
+                                if (sum_eig > (float)1e-30)
+                                {
+                                    int32_t ei;
+                                    for (ei = 0; ei < 3; ei++)
+                                    {
+                                        float p = evals[ei] * inv_sum;
+                                        if (p > (float)1e-30)
+                                            entropy -= p * log(p);
+                                    }
+                                }
+                                descriptors_out[out_off + 12] = entropy;
+                            }
+
+                            /* 13: surface_variation = l3 / (l1 + l2 + l3) */
+                            descriptors_out[out_off + 13] = evals[2] * inv_sum;
+                        }
+
+                        /* 14: z_range */
+                        descriptors_out[out_off + 14] = bb_max_z - bb_min_z;
+
+                        /* 15: z_above = max_z - query_z */
+                        descriptors_out[out_off + 15] = bb_max_z - qz;
+
+                        /* 16: z_below = query_z - min_z */
+                        descriptors_out[out_off + 16] = qz - bb_min_z;
+
+                        /* 17: z_std = sqrt(cov_zz) */
+                        descriptors_out[out_off + 17] = cov_zz > 0 ? sqrt(cov_zz) : 0;
+
+                        /* 18: density = k / bbox_volume */
+                        {
+                            float vol = (bb_max_x - bb_min_x) * (bb_max_y - bb_min_y) * (bb_max_z - bb_min_z);
+                            descriptors_out[out_off + 18] = vol > (float)1e-30 ? (float)(j + 1) / vol : 0;
+                        }
+
+                        /* 19: roughness = |dot(query - centroid, normal)| */
+                        {
+                            float dot = (qx - mx) * normal[0] + (qy - my) * normal[1] + (qz - mz) * normal[2];
+                            descriptors_out[out_off + 19] = dot >= 0 ? dot : -dot;
+                        }
+                    }
+                    scale_idx++;
+                }
+            }
+
+            /* Fill remaining scales with zeros */
+            for (s = scale_idx; s < num_scales; s++)
+            {
+                int64_t out_off = out_base + (int64_t)s * NUM_DESCRIPTORS;
+                int32_t f;
+                for (f = 0; f < NUM_DESCRIPTORS; f++)
+                    descriptors_out[out_off + f] = 0;
+                descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+            }
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
 Insert point into priority queue
 Params:
     closest_idx : index queue
@@ -1436,6 +1881,302 @@ void search_tree_float_int64_t(Tree_float_int64_t *tree, float *pa, float *point
 }
 
 /************************************************
+Compute mean k-NN Euclidean distances for Statistical Outlier Removal.
+Self-queries data points, skips closest neighbor (self), computes
+mean Euclidean distance to k remaining neighbors.
+Params:
+    tree : Tree struct of kd tree
+    pa : data points (also used as query points)
+    num_points : number of data points
+    k : number of neighbors (excluding self)
+    mean_dists_out : mean distances output, shape (num_points,)
+************************************************/
+void sor_mean_dists_float_int64_t(Tree_float_int64_t *tree, float *pa,
+                 uint64_t num_points, uint64_t k, float *mean_dists_out)
+{
+    int8_t no_dims = tree->no_dims;
+    float *bbox = tree->bbox;
+    uint64_t *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    uint64_t k_total = k + 1;  /* +1 to include self */
+    int64_t local_k_total = (int64_t) k_total;
+    Node_float_int64_t *root = (Node_float_int64_t *)tree->root;
+
+    #pragma omp parallel
+    {
+        uint64_t *local_idx = (uint64_t *)malloc(k_total * sizeof(uint64_t));
+        float *local_dist = (float *)malloc(k_total * sizeof(float));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            float min_dist, sum;
+            int64_t count;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_total; j++)
+            {
+                local_idx[j] = IDX_MAX_int64_t;
+                local_dist[j] = DIST_MAX_float;
+            }
+
+            /* Query k+1 neighbors (includes self) */
+            min_dist = get_min_dist_float(pa + no_dims * i, no_dims, bbox);
+            search_splitnode_float_int64_t(root, pa, pidx, no_dims,
+                             pa + no_dims * i, min_dist,
+                             k_total, DIST_MAX_float, (float)1.0, NULL,
+                             local_idx, local_dist);
+
+            /* Mean Euclidean distance, skipping closest (self, index 0) */
+            sum = 0;
+            count = 0;
+            for (j = 1; j < local_k_total; j++)
+            {
+                if (local_dist[j] < DIST_MAX_float)
+                {
+                    sum += sqrt(local_dist[j]);
+                    count++;
+                }
+            }
+            mean_dists_out[i] = (count > 0) ? sum / (float)count : 0;
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
+Compute comprehensive point descriptors in a single k-NN pass.
+Outputs NUM_DESCRIPTORS (20) features per point per scale:
+  0-2: eigenvalues (lambda1 >= lambda2 >= lambda3)
+  3-5: normal vector (nx, ny, nz)
+  6:   verticality (1 - |nz|)
+  7:   linearity = (l1 - l2) / l1
+  8:   planarity = (l2 - l3) / l1
+  9:   sphericity = l3 / l1
+  10:  omnivariance = (l1*l2*l3)^(1/3)
+  11:  anisotropy = (l1 - l3) / l1
+  12:  eigenentropy = -sum(li/S * ln(li/S))
+  13:  surface_variation = l3 / (l1+l2+l3)
+  14:  z_range (z_max - z_min of neighbors)
+  15:  z_above (max_z_neighbor - query_z)
+  16:  z_below (query_z - min_z_neighbor)
+  17:  z_std (height standard deviation of neighbors)
+  18:  density (k / bounding_box_volume)
+  19:  roughness (|point-to-plane distance|)
+k_scales must be sorted ascending.
+************************************************/
+void compute_descriptors_multiscale_float_int64_t(Tree_float_int64_t *tree, float *pa, float *point_coords,
+                 uint64_t num_points, uint64_t k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 float distance_upper_bound, float eps, uint8_t *mask,
+                 float *descriptors_out)
+{
+    float eps_fac = 1 / ((1 + eps) * (1 + eps));
+    int8_t no_dims = tree->no_dims;
+    float *bbox = tree->bbox;
+    uint64_t *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    int64_t local_k_max = (int64_t) k_max;
+    Node_float_int64_t *root = (Node_float_int64_t *)tree->root;
+
+    #pragma omp parallel
+    {
+        uint64_t *local_idx = (uint64_t *)malloc(k_max * sizeof(uint64_t));
+        float *local_dist = (float *)malloc(k_max * sizeof(float));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            float min_dist;
+            int32_t s, scale_idx;
+            float sum_x, sum_y, sum_z;
+            float sum_xx, sum_xy, sum_xz, sum_yy, sum_yz, sum_zz;
+            float bb_min_x, bb_min_y, bb_min_z, bb_max_x, bb_max_y, bb_max_z;
+            float *pt;
+            float px, py, pz;
+            float qx = point_coords[no_dims * i];
+            float qy = point_coords[no_dims * i + 1];
+            float qz = point_coords[no_dims * i + 2];
+            int64_t out_base = (int64_t)i * num_scales * NUM_DESCRIPTORS;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_max; j++)
+            {
+                local_idx[j] = IDX_MAX_int64_t;
+                local_dist[j] = DIST_MAX_float;
+            }
+
+            /* Query k_max neighbors */
+            min_dist = get_min_dist_float(point_coords + no_dims * i, no_dims, bbox);
+            search_splitnode_float_int64_t(root, pa, pidx, no_dims,
+                             point_coords + no_dims * i, min_dist,
+                             k_max, distance_upper_bound, eps_fac, mask,
+                             local_idx, local_dist);
+
+            /* Initialize accumulators */
+            sum_x = sum_y = sum_z = 0;
+            sum_xx = sum_xy = sum_xz = sum_yy = sum_yz = sum_zz = 0;
+            bb_min_x = bb_min_y = bb_min_z = DIST_MAX_float;
+            bb_max_x = bb_max_y = bb_max_z = -DIST_MAX_float;
+            scale_idx = 0;
+
+            for (j = 0; j < local_k_max && scale_idx < num_scales; j++)
+            {
+                if (local_idx[j] == IDX_MAX_int64_t || local_dist[j] >= DIST_MAX_float)
+                    break;
+
+                pt = pa + no_dims * local_idx[j];
+                px = pt[0]; py = pt[1]; pz = pt[2];
+
+                /* Accumulate sums for covariance */
+                sum_x += px; sum_y += py; sum_z += pz;
+                sum_xx += px * px; sum_xy += px * py; sum_xz += px * pz;
+                sum_yy += py * py; sum_yz += py * pz; sum_zz += pz * pz;
+
+                /* Update bounding box */
+                if (px < bb_min_x) bb_min_x = px;
+                if (px > bb_max_x) bb_max_x = px;
+                if (py < bb_min_y) bb_min_y = py;
+                if (py > bb_max_y) bb_max_y = py;
+                if (pz < bb_min_z) bb_min_z = pz;
+                if (pz > bb_max_z) bb_max_z = pz;
+
+                /* At each scale boundary, compute all descriptors */
+                if ((int32_t)(j + 1) == k_scales[scale_idx])
+                {
+                    int64_t out_off = out_base + (int64_t)scale_idx * NUM_DESCRIPTORS;
+                    float evals[3], normal[3];
+
+                    if (j + 1 < 2)
+                    {
+                        for (s = 0; s < NUM_DESCRIPTORS; s++)
+                            descriptors_out[out_off + s] = 0;
+                        descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+                    }
+                    else
+                    {
+                        float inv_k = 1 / (float)(j + 1);
+                        float mx = sum_x * inv_k;
+                        float my = sum_y * inv_k;
+                        float mz = sum_z * inv_k;
+
+                        float cov_xx = sum_xx * inv_k - mx * mx;
+                        float cov_xy = sum_xy * inv_k - mx * my;
+                        float cov_xz = sum_xz * inv_k - mx * mz;
+                        float cov_yy = sum_yy * inv_k - my * my;
+                        float cov_yz = sum_yz * inv_k - my * mz;
+                        float cov_zz = sum_zz * inv_k - mz * mz;
+
+                        eigen_symmetric_3x3_float(cov_xx, cov_xy, cov_xz,
+                                                     cov_yy, cov_yz, cov_zz,
+                                                     evals, normal);
+
+                        /* 0-2: eigenvalues */
+                        descriptors_out[out_off + 0] = evals[0];
+                        descriptors_out[out_off + 1] = evals[1];
+                        descriptors_out[out_off + 2] = evals[2];
+
+                        /* 3-5: normal */
+                        descriptors_out[out_off + 3] = normal[0];
+                        descriptors_out[out_off + 4] = normal[1];
+                        descriptors_out[out_off + 5] = normal[2];
+
+                        /* 6: verticality = 1 - |nz| */
+                        descriptors_out[out_off + 6] = 1 - (normal[2] >= 0 ? normal[2] : -normal[2]);
+
+                        /* 7-13: derived eigenvalue features */
+                        {
+                            float sum_eig = evals[0] + evals[1] + evals[2];
+                            float inv_l1 = evals[0] > (float)1e-30 ? 1 / evals[0] : 0;
+                            float inv_sum = sum_eig > (float)1e-30 ? 1 / sum_eig : 0;
+
+                            /* 7: linearity = (l1 - l2) / l1 */
+                            descriptors_out[out_off + 7] = (evals[0] - evals[1]) * inv_l1;
+
+                            /* 8: planarity = (l2 - l3) / l1 */
+                            descriptors_out[out_off + 8] = (evals[1] - evals[2]) * inv_l1;
+
+                            /* 9: sphericity = l3 / l1 */
+                            descriptors_out[out_off + 9] = evals[2] * inv_l1;
+
+                            /* 10: omnivariance = (l1 * l2 * l3)^(1/3) */
+                            {
+                                float prod = evals[0] * evals[1] * evals[2];
+                                descriptors_out[out_off + 10] = prod > 0 ? cbrt(prod) : 0;
+                            }
+
+                            /* 11: anisotropy = (l1 - l3) / l1 */
+                            descriptors_out[out_off + 11] = (evals[0] - evals[2]) * inv_l1;
+
+                            /* 12: eigenentropy = -sum(li/S * ln(li/S)) */
+                            {
+                                float entropy = 0;
+                                if (sum_eig > (float)1e-30)
+                                {
+                                    int32_t ei;
+                                    for (ei = 0; ei < 3; ei++)
+                                    {
+                                        float p = evals[ei] * inv_sum;
+                                        if (p > (float)1e-30)
+                                            entropy -= p * log(p);
+                                    }
+                                }
+                                descriptors_out[out_off + 12] = entropy;
+                            }
+
+                            /* 13: surface_variation = l3 / (l1 + l2 + l3) */
+                            descriptors_out[out_off + 13] = evals[2] * inv_sum;
+                        }
+
+                        /* 14: z_range */
+                        descriptors_out[out_off + 14] = bb_max_z - bb_min_z;
+
+                        /* 15: z_above = max_z - query_z */
+                        descriptors_out[out_off + 15] = bb_max_z - qz;
+
+                        /* 16: z_below = query_z - min_z */
+                        descriptors_out[out_off + 16] = qz - bb_min_z;
+
+                        /* 17: z_std = sqrt(cov_zz) */
+                        descriptors_out[out_off + 17] = cov_zz > 0 ? sqrt(cov_zz) : 0;
+
+                        /* 18: density = k / bbox_volume */
+                        {
+                            float vol = (bb_max_x - bb_min_x) * (bb_max_y - bb_min_y) * (bb_max_z - bb_min_z);
+                            descriptors_out[out_off + 18] = vol > (float)1e-30 ? (float)(j + 1) / vol : 0;
+                        }
+
+                        /* 19: roughness = |dot(query - centroid, normal)| */
+                        {
+                            float dot = (qx - mx) * normal[0] + (qy - my) * normal[1] + (qz - mz) * normal[2];
+                            descriptors_out[out_off + 19] = dot >= 0 ? dot : -dot;
+                        }
+                    }
+                    scale_idx++;
+                }
+            }
+
+            /* Fill remaining scales with zeros */
+            for (s = scale_idx; s < num_scales; s++)
+            {
+                int64_t out_off = out_base + (int64_t)s * NUM_DESCRIPTORS;
+                int32_t f;
+                for (f = 0; f < NUM_DESCRIPTORS; f++)
+                    descriptors_out[out_off + f] = 0;
+                descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+            }
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
 Calculate squared cartesian distance between points
 Params:
     point1_coord : point 1
@@ -1501,6 +2242,114 @@ double get_min_dist_double(double *point_coord, int8_t no_dims, double *bbox)
     }
 
     return cube_offset;
+}
+
+/************************************************
+Eigendecomposition of 3x3 symmetric matrix using Cardano's formula.
+Eigenvalues returned sorted: evals[0] >= evals[1] >= evals[2].
+Normal is the eigenvector of the smallest eigenvalue.
+Params:
+    cov_xx..cov_zz : upper triangle of symmetric matrix
+    evals : eigenvalues output (3 values)
+    normal : eigenvector of smallest eigenvalue (3 values)
+************************************************/
+void eigen_symmetric_3x3_double(double cov_xx, double cov_xy, double cov_xz,
+                                   double cov_yy, double cov_yz, double cov_zz,
+                                   double *evals, double *normal)
+{
+    double e1, e2, e3;
+    double p1 = cov_xy * cov_xy + cov_xz * cov_xz + cov_yz * cov_yz;
+    double q = (cov_xx + cov_yy + cov_zz) / 3;
+    double p2 = (cov_xx - q) * (cov_xx - q) + (cov_yy - q) * (cov_yy - q) +
+                  (cov_zz - q) * (cov_zz - q) + 2 * p1;
+    double p = sqrt(p2 / 6);
+
+    if (p < (double)1e-30)
+    {
+        /* All eigenvalues are equal */
+        e1 = e2 = e3 = q;
+    }
+    else
+    {
+        double inv_p = 1 / p;
+        /* B = (1/p)(M - q*I) */
+        double b00 = inv_p * (cov_xx - q);
+        double b01 = inv_p * cov_xy;
+        double b02 = inv_p * cov_xz;
+        double b11 = inv_p * (cov_yy - q);
+        double b12 = inv_p * cov_yz;
+        double b22 = inv_p * (cov_zz - q);
+
+        /* det(B) / 2 */
+        double r = (b00 * (b11 * b22 - b12 * b12)
+                     - b01 * (b01 * b22 - b12 * b02)
+                     + b02 * (b01 * b12 - b11 * b02)) / 2;
+
+        /* Clamp for numerical stability */
+        if (r <= -1) r = -1;
+        else if (r >= 1) r = 1;
+
+        double phi = acos(r) / 3;
+
+        e1 = q + 2 * p * cos(phi);
+        e3 = q + 2 * p * cos(phi + 2 * M_PI / 3);
+        e2 = 3 * q - e1 - e3;
+    }
+
+    /* Clamp negative eigenvalues to zero */
+    if (e1 < 0) e1 = 0;
+    if (e2 < 0) e2 = 0;
+    if (e3 < 0) e3 = 0;
+
+    evals[0] = e1;
+    evals[1] = e2;
+    evals[2] = e3;
+
+    /* Compute normal: eigenvector of smallest eigenvalue e3 */
+    /* Form rows of (M - e3*I) */
+    double r0x = cov_xx - e3, r0y = cov_xy,       r0z = cov_xz;
+    double r1x = cov_xy,       r1y = cov_yy - e3, r1z = cov_yz;
+    double r2x = cov_xz,       r2y = cov_yz,       r2z = cov_zz - e3;
+
+    /* Cross products of all row pairs, pick largest */
+    double nx, ny, nz, len_sq, best_len_sq;
+    double cx, cy, cz;
+
+    /* r0 x r1 */
+    nx = r0y * r1z - r0z * r1y;
+    ny = r0z * r1x - r0x * r1z;
+    nz = r0x * r1y - r0y * r1x;
+    best_len_sq = nx * nx + ny * ny + nz * nz;
+
+    /* r0 x r2 */
+    cx = r0y * r2z - r0z * r2y;
+    cy = r0z * r2x - r0x * r2z;
+    cz = r0x * r2y - r0y * r2x;
+    len_sq = cx * cx + cy * cy + cz * cz;
+    if (len_sq > best_len_sq) { nx = cx; ny = cy; nz = cz; best_len_sq = len_sq; }
+
+    /* r1 x r2 */
+    cx = r1y * r2z - r1z * r2y;
+    cy = r1z * r2x - r1x * r2z;
+    cz = r1x * r2y - r1y * r2x;
+    len_sq = cx * cx + cy * cy + cz * cz;
+    if (len_sq > best_len_sq) { nx = cx; ny = cy; nz = cz; best_len_sq = len_sq; }
+
+    /* Normalize */
+    if (best_len_sq > (double)1e-30)
+    {
+        double inv_len = 1 / sqrt(best_len_sq);
+        normal[0] = nx * inv_len;
+        normal[1] = ny * inv_len;
+        normal[2] = nz * inv_len;
+    }
+    else
+    {
+        /* Degenerate case */
+        normal[0] = 0;
+        normal[1] = 0;
+        normal[2] = 1;
+    }
 }
 
 
@@ -2077,6 +2926,302 @@ void search_tree_double_int32_t(Tree_double_int32_t *tree, double *pa, double *p
 }
 
 /************************************************
+Compute mean k-NN Euclidean distances for Statistical Outlier Removal.
+Self-queries data points, skips closest neighbor (self), computes
+mean Euclidean distance to k remaining neighbors.
+Params:
+    tree : Tree struct of kd tree
+    pa : data points (also used as query points)
+    num_points : number of data points
+    k : number of neighbors (excluding self)
+    mean_dists_out : mean distances output, shape (num_points,)
+************************************************/
+void sor_mean_dists_double_int32_t(Tree_double_int32_t *tree, double *pa,
+                 uint32_t num_points, uint32_t k, double *mean_dists_out)
+{
+    int8_t no_dims = tree->no_dims;
+    double *bbox = tree->bbox;
+    uint32_t *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    uint32_t k_total = k + 1;  /* +1 to include self */
+    int64_t local_k_total = (int64_t) k_total;
+    Node_double_int32_t *root = (Node_double_int32_t *)tree->root;
+
+    #pragma omp parallel
+    {
+        uint32_t *local_idx = (uint32_t *)malloc(k_total * sizeof(uint32_t));
+        double *local_dist = (double *)malloc(k_total * sizeof(double));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            double min_dist, sum;
+            int64_t count;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_total; j++)
+            {
+                local_idx[j] = IDX_MAX_int32_t;
+                local_dist[j] = DIST_MAX_double;
+            }
+
+            /* Query k+1 neighbors (includes self) */
+            min_dist = get_min_dist_double(pa + no_dims * i, no_dims, bbox);
+            search_splitnode_double_int32_t(root, pa, pidx, no_dims,
+                             pa + no_dims * i, min_dist,
+                             k_total, DIST_MAX_double, (double)1.0, NULL,
+                             local_idx, local_dist);
+
+            /* Mean Euclidean distance, skipping closest (self, index 0) */
+            sum = 0;
+            count = 0;
+            for (j = 1; j < local_k_total; j++)
+            {
+                if (local_dist[j] < DIST_MAX_double)
+                {
+                    sum += sqrt(local_dist[j]);
+                    count++;
+                }
+            }
+            mean_dists_out[i] = (count > 0) ? sum / (double)count : 0;
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
+Compute comprehensive point descriptors in a single k-NN pass.
+Outputs NUM_DESCRIPTORS (20) features per point per scale:
+  0-2: eigenvalues (lambda1 >= lambda2 >= lambda3)
+  3-5: normal vector (nx, ny, nz)
+  6:   verticality (1 - |nz|)
+  7:   linearity = (l1 - l2) / l1
+  8:   planarity = (l2 - l3) / l1
+  9:   sphericity = l3 / l1
+  10:  omnivariance = (l1*l2*l3)^(1/3)
+  11:  anisotropy = (l1 - l3) / l1
+  12:  eigenentropy = -sum(li/S * ln(li/S))
+  13:  surface_variation = l3 / (l1+l2+l3)
+  14:  z_range (z_max - z_min of neighbors)
+  15:  z_above (max_z_neighbor - query_z)
+  16:  z_below (query_z - min_z_neighbor)
+  17:  z_std (height standard deviation of neighbors)
+  18:  density (k / bounding_box_volume)
+  19:  roughness (|point-to-plane distance|)
+k_scales must be sorted ascending.
+************************************************/
+void compute_descriptors_multiscale_double_int32_t(Tree_double_int32_t *tree, double *pa, double *point_coords,
+                 uint32_t num_points, uint32_t k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 double distance_upper_bound, double eps, uint8_t *mask,
+                 double *descriptors_out)
+{
+    double eps_fac = 1 / ((1 + eps) * (1 + eps));
+    int8_t no_dims = tree->no_dims;
+    double *bbox = tree->bbox;
+    uint32_t *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    int64_t local_k_max = (int64_t) k_max;
+    Node_double_int32_t *root = (Node_double_int32_t *)tree->root;
+
+    #pragma omp parallel
+    {
+        uint32_t *local_idx = (uint32_t *)malloc(k_max * sizeof(uint32_t));
+        double *local_dist = (double *)malloc(k_max * sizeof(double));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            double min_dist;
+            int32_t s, scale_idx;
+            double sum_x, sum_y, sum_z;
+            double sum_xx, sum_xy, sum_xz, sum_yy, sum_yz, sum_zz;
+            double bb_min_x, bb_min_y, bb_min_z, bb_max_x, bb_max_y, bb_max_z;
+            double *pt;
+            double px, py, pz;
+            double qx = point_coords[no_dims * i];
+            double qy = point_coords[no_dims * i + 1];
+            double qz = point_coords[no_dims * i + 2];
+            int64_t out_base = (int64_t)i * num_scales * NUM_DESCRIPTORS;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_max; j++)
+            {
+                local_idx[j] = IDX_MAX_int32_t;
+                local_dist[j] = DIST_MAX_double;
+            }
+
+            /* Query k_max neighbors */
+            min_dist = get_min_dist_double(point_coords + no_dims * i, no_dims, bbox);
+            search_splitnode_double_int32_t(root, pa, pidx, no_dims,
+                             point_coords + no_dims * i, min_dist,
+                             k_max, distance_upper_bound, eps_fac, mask,
+                             local_idx, local_dist);
+
+            /* Initialize accumulators */
+            sum_x = sum_y = sum_z = 0;
+            sum_xx = sum_xy = sum_xz = sum_yy = sum_yz = sum_zz = 0;
+            bb_min_x = bb_min_y = bb_min_z = DIST_MAX_double;
+            bb_max_x = bb_max_y = bb_max_z = -DIST_MAX_double;
+            scale_idx = 0;
+
+            for (j = 0; j < local_k_max && scale_idx < num_scales; j++)
+            {
+                if (local_idx[j] == IDX_MAX_int32_t || local_dist[j] >= DIST_MAX_double)
+                    break;
+
+                pt = pa + no_dims * local_idx[j];
+                px = pt[0]; py = pt[1]; pz = pt[2];
+
+                /* Accumulate sums for covariance */
+                sum_x += px; sum_y += py; sum_z += pz;
+                sum_xx += px * px; sum_xy += px * py; sum_xz += px * pz;
+                sum_yy += py * py; sum_yz += py * pz; sum_zz += pz * pz;
+
+                /* Update bounding box */
+                if (px < bb_min_x) bb_min_x = px;
+                if (px > bb_max_x) bb_max_x = px;
+                if (py < bb_min_y) bb_min_y = py;
+                if (py > bb_max_y) bb_max_y = py;
+                if (pz < bb_min_z) bb_min_z = pz;
+                if (pz > bb_max_z) bb_max_z = pz;
+
+                /* At each scale boundary, compute all descriptors */
+                if ((int32_t)(j + 1) == k_scales[scale_idx])
+                {
+                    int64_t out_off = out_base + (int64_t)scale_idx * NUM_DESCRIPTORS;
+                    double evals[3], normal[3];
+
+                    if (j + 1 < 2)
+                    {
+                        for (s = 0; s < NUM_DESCRIPTORS; s++)
+                            descriptors_out[out_off + s] = 0;
+                        descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+                    }
+                    else
+                    {
+                        double inv_k = 1 / (double)(j + 1);
+                        double mx = sum_x * inv_k;
+                        double my = sum_y * inv_k;
+                        double mz = sum_z * inv_k;
+
+                        double cov_xx = sum_xx * inv_k - mx * mx;
+                        double cov_xy = sum_xy * inv_k - mx * my;
+                        double cov_xz = sum_xz * inv_k - mx * mz;
+                        double cov_yy = sum_yy * inv_k - my * my;
+                        double cov_yz = sum_yz * inv_k - my * mz;
+                        double cov_zz = sum_zz * inv_k - mz * mz;
+
+                        eigen_symmetric_3x3_double(cov_xx, cov_xy, cov_xz,
+                                                     cov_yy, cov_yz, cov_zz,
+                                                     evals, normal);
+
+                        /* 0-2: eigenvalues */
+                        descriptors_out[out_off + 0] = evals[0];
+                        descriptors_out[out_off + 1] = evals[1];
+                        descriptors_out[out_off + 2] = evals[2];
+
+                        /* 3-5: normal */
+                        descriptors_out[out_off + 3] = normal[0];
+                        descriptors_out[out_off + 4] = normal[1];
+                        descriptors_out[out_off + 5] = normal[2];
+
+                        /* 6: verticality = 1 - |nz| */
+                        descriptors_out[out_off + 6] = 1 - (normal[2] >= 0 ? normal[2] : -normal[2]);
+
+                        /* 7-13: derived eigenvalue features */
+                        {
+                            double sum_eig = evals[0] + evals[1] + evals[2];
+                            double inv_l1 = evals[0] > (double)1e-30 ? 1 / evals[0] : 0;
+                            double inv_sum = sum_eig > (double)1e-30 ? 1 / sum_eig : 0;
+
+                            /* 7: linearity = (l1 - l2) / l1 */
+                            descriptors_out[out_off + 7] = (evals[0] - evals[1]) * inv_l1;
+
+                            /* 8: planarity = (l2 - l3) / l1 */
+                            descriptors_out[out_off + 8] = (evals[1] - evals[2]) * inv_l1;
+
+                            /* 9: sphericity = l3 / l1 */
+                            descriptors_out[out_off + 9] = evals[2] * inv_l1;
+
+                            /* 10: omnivariance = (l1 * l2 * l3)^(1/3) */
+                            {
+                                double prod = evals[0] * evals[1] * evals[2];
+                                descriptors_out[out_off + 10] = prod > 0 ? cbrt(prod) : 0;
+                            }
+
+                            /* 11: anisotropy = (l1 - l3) / l1 */
+                            descriptors_out[out_off + 11] = (evals[0] - evals[2]) * inv_l1;
+
+                            /* 12: eigenentropy = -sum(li/S * ln(li/S)) */
+                            {
+                                double entropy = 0;
+                                if (sum_eig > (double)1e-30)
+                                {
+                                    int32_t ei;
+                                    for (ei = 0; ei < 3; ei++)
+                                    {
+                                        double p = evals[ei] * inv_sum;
+                                        if (p > (double)1e-30)
+                                            entropy -= p * log(p);
+                                    }
+                                }
+                                descriptors_out[out_off + 12] = entropy;
+                            }
+
+                            /* 13: surface_variation = l3 / (l1 + l2 + l3) */
+                            descriptors_out[out_off + 13] = evals[2] * inv_sum;
+                        }
+
+                        /* 14: z_range */
+                        descriptors_out[out_off + 14] = bb_max_z - bb_min_z;
+
+                        /* 15: z_above = max_z - query_z */
+                        descriptors_out[out_off + 15] = bb_max_z - qz;
+
+                        /* 16: z_below = query_z - min_z */
+                        descriptors_out[out_off + 16] = qz - bb_min_z;
+
+                        /* 17: z_std = sqrt(cov_zz) */
+                        descriptors_out[out_off + 17] = cov_zz > 0 ? sqrt(cov_zz) : 0;
+
+                        /* 18: density = k / bbox_volume */
+                        {
+                            double vol = (bb_max_x - bb_min_x) * (bb_max_y - bb_min_y) * (bb_max_z - bb_min_z);
+                            descriptors_out[out_off + 18] = vol > (double)1e-30 ? (double)(j + 1) / vol : 0;
+                        }
+
+                        /* 19: roughness = |dot(query - centroid, normal)| */
+                        {
+                            double dot = (qx - mx) * normal[0] + (qy - my) * normal[1] + (qz - mz) * normal[2];
+                            descriptors_out[out_off + 19] = dot >= 0 ? dot : -dot;
+                        }
+                    }
+                    scale_idx++;
+                }
+            }
+
+            /* Fill remaining scales with zeros */
+            for (s = scale_idx; s < num_scales; s++)
+            {
+                int64_t out_off = out_base + (int64_t)s * NUM_DESCRIPTORS;
+                int32_t f;
+                for (f = 0; f < NUM_DESCRIPTORS; f++)
+                    descriptors_out[out_off + f] = 0;
+                descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+            }
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
 Insert point into priority queue
 Params:
     closest_idx : index queue
@@ -2645,5 +3790,301 @@ void search_tree_double_int64_t(Tree_double_int64_t *tree, double *pa, double *p
             search_splitnode_double_int64_t(root, pa, pidx, no_dims, point_coords + no_dims * i, min_dist,
                              k, distance_upper_bound, eps_fac, mask, &closest_idxs[i * k], &closest_dists[i * k]);
         }
+    }
+}
+
+/************************************************
+Compute mean k-NN Euclidean distances for Statistical Outlier Removal.
+Self-queries data points, skips closest neighbor (self), computes
+mean Euclidean distance to k remaining neighbors.
+Params:
+    tree : Tree struct of kd tree
+    pa : data points (also used as query points)
+    num_points : number of data points
+    k : number of neighbors (excluding self)
+    mean_dists_out : mean distances output, shape (num_points,)
+************************************************/
+void sor_mean_dists_double_int64_t(Tree_double_int64_t *tree, double *pa,
+                 uint64_t num_points, uint64_t k, double *mean_dists_out)
+{
+    int8_t no_dims = tree->no_dims;
+    double *bbox = tree->bbox;
+    uint64_t *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    uint64_t k_total = k + 1;  /* +1 to include self */
+    int64_t local_k_total = (int64_t) k_total;
+    Node_double_int64_t *root = (Node_double_int64_t *)tree->root;
+
+    #pragma omp parallel
+    {
+        uint64_t *local_idx = (uint64_t *)malloc(k_total * sizeof(uint64_t));
+        double *local_dist = (double *)malloc(k_total * sizeof(double));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            double min_dist, sum;
+            int64_t count;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_total; j++)
+            {
+                local_idx[j] = IDX_MAX_int64_t;
+                local_dist[j] = DIST_MAX_double;
+            }
+
+            /* Query k+1 neighbors (includes self) */
+            min_dist = get_min_dist_double(pa + no_dims * i, no_dims, bbox);
+            search_splitnode_double_int64_t(root, pa, pidx, no_dims,
+                             pa + no_dims * i, min_dist,
+                             k_total, DIST_MAX_double, (double)1.0, NULL,
+                             local_idx, local_dist);
+
+            /* Mean Euclidean distance, skipping closest (self, index 0) */
+            sum = 0;
+            count = 0;
+            for (j = 1; j < local_k_total; j++)
+            {
+                if (local_dist[j] < DIST_MAX_double)
+                {
+                    sum += sqrt(local_dist[j]);
+                    count++;
+                }
+            }
+            mean_dists_out[i] = (count > 0) ? sum / (double)count : 0;
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
+Compute comprehensive point descriptors in a single k-NN pass.
+Outputs NUM_DESCRIPTORS (20) features per point per scale:
+  0-2: eigenvalues (lambda1 >= lambda2 >= lambda3)
+  3-5: normal vector (nx, ny, nz)
+  6:   verticality (1 - |nz|)
+  7:   linearity = (l1 - l2) / l1
+  8:   planarity = (l2 - l3) / l1
+  9:   sphericity = l3 / l1
+  10:  omnivariance = (l1*l2*l3)^(1/3)
+  11:  anisotropy = (l1 - l3) / l1
+  12:  eigenentropy = -sum(li/S * ln(li/S))
+  13:  surface_variation = l3 / (l1+l2+l3)
+  14:  z_range (z_max - z_min of neighbors)
+  15:  z_above (max_z_neighbor - query_z)
+  16:  z_below (query_z - min_z_neighbor)
+  17:  z_std (height standard deviation of neighbors)
+  18:  density (k / bounding_box_volume)
+  19:  roughness (|point-to-plane distance|)
+k_scales must be sorted ascending.
+************************************************/
+void compute_descriptors_multiscale_double_int64_t(Tree_double_int64_t *tree, double *pa, double *point_coords,
+                 uint64_t num_points, uint64_t k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 double distance_upper_bound, double eps, uint8_t *mask,
+                 double *descriptors_out)
+{
+    double eps_fac = 1 / ((1 + eps) * (1 + eps));
+    int8_t no_dims = tree->no_dims;
+    double *bbox = tree->bbox;
+    uint64_t *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    int64_t local_k_max = (int64_t) k_max;
+    Node_double_int64_t *root = (Node_double_int64_t *)tree->root;
+
+    #pragma omp parallel
+    {
+        uint64_t *local_idx = (uint64_t *)malloc(k_max * sizeof(uint64_t));
+        double *local_dist = (double *)malloc(k_max * sizeof(double));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            double min_dist;
+            int32_t s, scale_idx;
+            double sum_x, sum_y, sum_z;
+            double sum_xx, sum_xy, sum_xz, sum_yy, sum_yz, sum_zz;
+            double bb_min_x, bb_min_y, bb_min_z, bb_max_x, bb_max_y, bb_max_z;
+            double *pt;
+            double px, py, pz;
+            double qx = point_coords[no_dims * i];
+            double qy = point_coords[no_dims * i + 1];
+            double qz = point_coords[no_dims * i + 2];
+            int64_t out_base = (int64_t)i * num_scales * NUM_DESCRIPTORS;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_max; j++)
+            {
+                local_idx[j] = IDX_MAX_int64_t;
+                local_dist[j] = DIST_MAX_double;
+            }
+
+            /* Query k_max neighbors */
+            min_dist = get_min_dist_double(point_coords + no_dims * i, no_dims, bbox);
+            search_splitnode_double_int64_t(root, pa, pidx, no_dims,
+                             point_coords + no_dims * i, min_dist,
+                             k_max, distance_upper_bound, eps_fac, mask,
+                             local_idx, local_dist);
+
+            /* Initialize accumulators */
+            sum_x = sum_y = sum_z = 0;
+            sum_xx = sum_xy = sum_xz = sum_yy = sum_yz = sum_zz = 0;
+            bb_min_x = bb_min_y = bb_min_z = DIST_MAX_double;
+            bb_max_x = bb_max_y = bb_max_z = -DIST_MAX_double;
+            scale_idx = 0;
+
+            for (j = 0; j < local_k_max && scale_idx < num_scales; j++)
+            {
+                if (local_idx[j] == IDX_MAX_int64_t || local_dist[j] >= DIST_MAX_double)
+                    break;
+
+                pt = pa + no_dims * local_idx[j];
+                px = pt[0]; py = pt[1]; pz = pt[2];
+
+                /* Accumulate sums for covariance */
+                sum_x += px; sum_y += py; sum_z += pz;
+                sum_xx += px * px; sum_xy += px * py; sum_xz += px * pz;
+                sum_yy += py * py; sum_yz += py * pz; sum_zz += pz * pz;
+
+                /* Update bounding box */
+                if (px < bb_min_x) bb_min_x = px;
+                if (px > bb_max_x) bb_max_x = px;
+                if (py < bb_min_y) bb_min_y = py;
+                if (py > bb_max_y) bb_max_y = py;
+                if (pz < bb_min_z) bb_min_z = pz;
+                if (pz > bb_max_z) bb_max_z = pz;
+
+                /* At each scale boundary, compute all descriptors */
+                if ((int32_t)(j + 1) == k_scales[scale_idx])
+                {
+                    int64_t out_off = out_base + (int64_t)scale_idx * NUM_DESCRIPTORS;
+                    double evals[3], normal[3];
+
+                    if (j + 1 < 2)
+                    {
+                        for (s = 0; s < NUM_DESCRIPTORS; s++)
+                            descriptors_out[out_off + s] = 0;
+                        descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+                    }
+                    else
+                    {
+                        double inv_k = 1 / (double)(j + 1);
+                        double mx = sum_x * inv_k;
+                        double my = sum_y * inv_k;
+                        double mz = sum_z * inv_k;
+
+                        double cov_xx = sum_xx * inv_k - mx * mx;
+                        double cov_xy = sum_xy * inv_k - mx * my;
+                        double cov_xz = sum_xz * inv_k - mx * mz;
+                        double cov_yy = sum_yy * inv_k - my * my;
+                        double cov_yz = sum_yz * inv_k - my * mz;
+                        double cov_zz = sum_zz * inv_k - mz * mz;
+
+                        eigen_symmetric_3x3_double(cov_xx, cov_xy, cov_xz,
+                                                     cov_yy, cov_yz, cov_zz,
+                                                     evals, normal);
+
+                        /* 0-2: eigenvalues */
+                        descriptors_out[out_off + 0] = evals[0];
+                        descriptors_out[out_off + 1] = evals[1];
+                        descriptors_out[out_off + 2] = evals[2];
+
+                        /* 3-5: normal */
+                        descriptors_out[out_off + 3] = normal[0];
+                        descriptors_out[out_off + 4] = normal[1];
+                        descriptors_out[out_off + 5] = normal[2];
+
+                        /* 6: verticality = 1 - |nz| */
+                        descriptors_out[out_off + 6] = 1 - (normal[2] >= 0 ? normal[2] : -normal[2]);
+
+                        /* 7-13: derived eigenvalue features */
+                        {
+                            double sum_eig = evals[0] + evals[1] + evals[2];
+                            double inv_l1 = evals[0] > (double)1e-30 ? 1 / evals[0] : 0;
+                            double inv_sum = sum_eig > (double)1e-30 ? 1 / sum_eig : 0;
+
+                            /* 7: linearity = (l1 - l2) / l1 */
+                            descriptors_out[out_off + 7] = (evals[0] - evals[1]) * inv_l1;
+
+                            /* 8: planarity = (l2 - l3) / l1 */
+                            descriptors_out[out_off + 8] = (evals[1] - evals[2]) * inv_l1;
+
+                            /* 9: sphericity = l3 / l1 */
+                            descriptors_out[out_off + 9] = evals[2] * inv_l1;
+
+                            /* 10: omnivariance = (l1 * l2 * l3)^(1/3) */
+                            {
+                                double prod = evals[0] * evals[1] * evals[2];
+                                descriptors_out[out_off + 10] = prod > 0 ? cbrt(prod) : 0;
+                            }
+
+                            /* 11: anisotropy = (l1 - l3) / l1 */
+                            descriptors_out[out_off + 11] = (evals[0] - evals[2]) * inv_l1;
+
+                            /* 12: eigenentropy = -sum(li/S * ln(li/S)) */
+                            {
+                                double entropy = 0;
+                                if (sum_eig > (double)1e-30)
+                                {
+                                    int32_t ei;
+                                    for (ei = 0; ei < 3; ei++)
+                                    {
+                                        double p = evals[ei] * inv_sum;
+                                        if (p > (double)1e-30)
+                                            entropy -= p * log(p);
+                                    }
+                                }
+                                descriptors_out[out_off + 12] = entropy;
+                            }
+
+                            /* 13: surface_variation = l3 / (l1 + l2 + l3) */
+                            descriptors_out[out_off + 13] = evals[2] * inv_sum;
+                        }
+
+                        /* 14: z_range */
+                        descriptors_out[out_off + 14] = bb_max_z - bb_min_z;
+
+                        /* 15: z_above = max_z - query_z */
+                        descriptors_out[out_off + 15] = bb_max_z - qz;
+
+                        /* 16: z_below = query_z - min_z */
+                        descriptors_out[out_off + 16] = qz - bb_min_z;
+
+                        /* 17: z_std = sqrt(cov_zz) */
+                        descriptors_out[out_off + 17] = cov_zz > 0 ? sqrt(cov_zz) : 0;
+
+                        /* 18: density = k / bbox_volume */
+                        {
+                            double vol = (bb_max_x - bb_min_x) * (bb_max_y - bb_min_y) * (bb_max_z - bb_min_z);
+                            descriptors_out[out_off + 18] = vol > (double)1e-30 ? (double)(j + 1) / vol : 0;
+                        }
+
+                        /* 19: roughness = |dot(query - centroid, normal)| */
+                        {
+                            double dot = (qx - mx) * normal[0] + (qy - my) * normal[1] + (qz - mz) * normal[2];
+                            descriptors_out[out_off + 19] = dot >= 0 ? dot : -dot;
+                        }
+                    }
+                    scale_idx++;
+                }
+            }
+
+            /* Fill remaining scales with zeros */
+            for (s = scale_idx; s < num_scales; s++)
+            {
+                int64_t out_off = out_base + (int64_t)s * NUM_DESCRIPTORS;
+                int32_t f;
+                for (f = 0; f < NUM_DESCRIPTORS; f++)
+                    descriptors_out[out_off + f] = 0;
+                descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+            }
+        }
+
+        free(local_idx);
+        free(local_dist);
     }
 }

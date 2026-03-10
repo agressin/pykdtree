@@ -17,10 +17,45 @@
 
 import numpy as np
 cimport numpy as np
-from libc.stdint cimport uint64_t, uint32_t, int8_t, uint8_t, UINT32_MAX
+from libc.stdint cimport uint64_t, uint32_t, int32_t, int8_t, uint8_t, UINT32_MAX
 cimport cython
 
 np.import_array()
+
+
+class DESC:
+    """Named constants for compute_descriptors() feature indices."""
+    EIGENVALUE_1 = 0
+    EIGENVALUE_2 = 1
+    EIGENVALUE_3 = 2
+    NORMAL_X = 3
+    NORMAL_Y = 4
+    NORMAL_Z = 5
+    VERTICALITY = 6
+    LINEARITY = 7
+    PLANARITY = 8
+    SPHERICITY = 9
+    OMNIVARIANCE = 10
+    ANISOTROPY = 11
+    EIGENENTROPY = 12
+    SURFACE_VARIATION = 13
+    Z_RANGE = 14
+    Z_ABOVE = 15
+    Z_BELOW = 16
+    Z_STD = 17
+    DENSITY = 18
+    ROUGHNESS = 19
+    COUNT = 20
+    NAMES = [
+        'eigenvalue_1', 'eigenvalue_2', 'eigenvalue_3',
+        'normal_x', 'normal_y', 'normal_z',
+        'verticality',
+        'linearity', 'planarity', 'sphericity', 'omnivariance',
+        'anisotropy', 'eigenentropy', 'surface_variation',
+        'z_range', 'z_above', 'z_below', 'z_std',
+        'density', 'roughness',
+    ]
+
 
 # Node structure
 cdef struct node_float_int32_t:
@@ -102,6 +137,16 @@ cdef extern void delete_tree_float_int64_t(tree_float_int64_t *kdtree)
 cdef extern tree_double_int64_t* construct_tree_double_int64_t(double *pa, int8_t no_dims, uint64_t n, uint64_t bsp) nogil
 cdef extern void search_tree_double_int64_t(tree_double_int64_t *kdtree, double *pa, double *point_coords, uint64_t num_points, uint64_t k, double distance_upper_bound, double eps_fac, uint8_t *mask, uint64_t *closest_idxs, double *closest_dists) nogil
 cdef extern void delete_tree_double_int64_t(tree_double_int64_t *kdtree)
+
+cdef extern void compute_descriptors_multiscale_float_int32_t(tree_float_int32_t *tree, float *pa, float *point_coords, uint32_t num_points, uint32_t k_max, int32_t *k_scales, int32_t num_scales, float distance_upper_bound, float eps, uint8_t *mask, float *descriptors_out) nogil
+cdef extern void compute_descriptors_multiscale_double_int32_t(tree_double_int32_t *tree, double *pa, double *point_coords, uint32_t num_points, uint32_t k_max, int32_t *k_scales, int32_t num_scales, double distance_upper_bound, double eps, uint8_t *mask, double *descriptors_out) nogil
+cdef extern void compute_descriptors_multiscale_float_int64_t(tree_float_int64_t *tree, float *pa, float *point_coords, uint64_t num_points, uint64_t k_max, int32_t *k_scales, int32_t num_scales, float distance_upper_bound, float eps, uint8_t *mask, float *descriptors_out) nogil
+cdef extern void compute_descriptors_multiscale_double_int64_t(tree_double_int64_t *tree, double *pa, double *point_coords, uint64_t num_points, uint64_t k_max, int32_t *k_scales, int32_t num_scales, double distance_upper_bound, double eps, uint8_t *mask, double *descriptors_out) nogil
+
+cdef extern void sor_mean_dists_float_int32_t(tree_float_int32_t *tree, float *pa, uint32_t num_points, uint32_t k, float *mean_dists_out) nogil
+cdef extern void sor_mean_dists_double_int32_t(tree_double_int32_t *tree, double *pa, uint32_t num_points, uint32_t k, double *mean_dists_out) nogil
+cdef extern void sor_mean_dists_float_int64_t(tree_float_int64_t *tree, float *pa, uint64_t num_points, uint64_t k, float *mean_dists_out) nogil
+cdef extern void sor_mean_dists_double_int64_t(tree_double_int64_t *tree, double *pa, uint64_t num_points, uint64_t k, double *mean_dists_out) nogil
 
 cdef class KDTree:
     """kd-tree for fast nearest-neighbour lookup.
@@ -355,6 +400,242 @@ cdef class KDTree:
             closest_dists_res = np.sqrt(closest_dists_res)
 
         return closest_dists_res, closest_idxs_res
+
+    def compute_descriptors(KDTree self, np.ndarray query_pts not None, k=16, eps=0,
+                            distance_upper_bound=None, mask=None):
+        """Compute comprehensive point descriptors in a single k-NN pass.
+
+        Outputs 20 features per point per scale, suitable for deep learning.
+        Supports multi-scale: pass k as a list (e.g. [5, 10, 20]).
+        Only works for 3D data (ndim=3).
+
+        Features (20 per point per scale) - use DESC.* constants for indexing:
+          0-2: eigenvalues (lambda1 >= lambda2 >= lambda3)
+          3-5: normal vector (nx, ny, nz)
+          6:   verticality (1 - |nz|)
+          7:   linearity = (l1 - l2) / l1
+          8:   planarity = (l2 - l3) / l1
+          9:   sphericity = l3 / l1
+          10:  omnivariance = (l1*l2*l3)^(1/3)
+          11:  anisotropy = (l1 - l3) / l1
+          12:  eigenentropy = -sum(li/S * ln(li/S))
+          13:  surface_variation = l3 / (l1+l2+l3)
+          14:  z_range (height range of neighbors)
+          15:  z_above (max neighbor z - query z)
+          16:  z_below (query z - min neighbor z)
+          17:  z_std (height std of neighbors)
+          18:  density (k / bounding box volume)
+          19:  roughness (point-to-plane distance)
+
+        :Parameters:
+        query_pts : numpy array, shape (m, 3)
+        k : int or list of ints
+        eps : non-negative float
+        distance_upper_bound : non-negative float, optional
+        mask : numpy array, optional
+
+        :Returns:
+        descriptors : numpy array
+            Shape (m, 20) if k is int, (m, num_scales, 20) if k is list.
+        """
+
+        if self.ndim != 3:
+            raise ValueError('compute_descriptors only supports 3D data (ndim=3)')
+        if eps < 0:
+            raise ValueError('eps must be non-negative')
+        if distance_upper_bound is not None and distance_upper_bound < 0:
+            raise ValueError('distance_upper_bound must be non-negative')
+
+        if query_pts.ndim == 1:
+            q_ndim = 1
+        else:
+            q_ndim = query_pts.shape[1]
+        if self.ndim != q_ndim:
+            raise ValueError('Data and query points must have same dimensions')
+        if self.data_pts.dtype == np.float32 and query_pts.dtype != np.float32:
+            raise TypeError('Type mismatch. query points must be of type float32 when data points are of type float32')
+
+        cdef bint multiscale = isinstance(k, (list, tuple))
+        cdef np.ndarray[int32_t, ndim=1] k_scales_arr
+        cdef int32_t *k_scales_data
+        cdef int32_t c_num_scales
+        cdef int32_t NUM_DESC = 20
+
+        if multiscale:
+            k_scales_arr = np.array(sorted(k), dtype=np.int32)
+            k_scales_data = <int32_t *>k_scales_arr.data
+            c_num_scales = <int32_t>len(k_scales_arr)
+            if c_num_scales == 0:
+                raise ValueError('k must be a non-empty list')
+            if k_scales_arr[0] < 2:
+                raise ValueError('All k values must be >= 2')
+            k_max_val = int(k_scales_arr[c_num_scales - 1])
+        else:
+            if k < 2:
+                raise ValueError('k must be >= 2')
+            k_max_val = int(k)
+            k_scales_arr = np.array([k], dtype=np.int32)
+            k_scales_data = <int32_t *>k_scales_arr.data
+            c_num_scales = 1
+
+        cdef uint64_t num_qpoints = query_pts.shape[0]
+        cdef uint64_t num_k_max = k_max_val
+        cdef uint64_t total_out = num_qpoints * c_num_scales * NUM_DESC
+
+        cdef np.ndarray[float, ndim=1] desc_float
+        cdef np.ndarray[double, ndim=1] desc_double
+        cdef float *desc_data_float
+        cdef double *desc_data_double
+
+        cdef np.ndarray[float, ndim=1] query_array_float
+        cdef np.ndarray[double, ndim=1] query_array_double
+        cdef float *query_array_data_float
+        cdef double *query_array_data_double
+
+        cdef np.ndarray[np.uint8_t, ndim=1] query_mask
+        cdef np.uint8_t *query_mask_data
+
+        if mask is not None and mask.size != self.n:
+            raise ValueError('Mask must have the same size as data points')
+        elif mask is not None:
+            query_mask = np.ascontiguousarray(mask.ravel(), dtype=np.uint8)
+            query_mask_data = <uint8_t *>query_mask.data
+        else:
+            query_mask_data = NULL
+
+        cdef float dub_float
+        cdef double dub_double
+        if distance_upper_bound is None:
+            if self.data_pts.dtype == np.float32:
+                dub_float = <float>np.finfo(np.float32).max
+            else:
+                dub_double = <double>np.finfo(np.float64).max
+        else:
+            if self.data_pts.dtype == np.float32:
+                dub_float = <float>(distance_upper_bound * distance_upper_bound)
+            else:
+                dub_double = <double>(distance_upper_bound * distance_upper_bound)
+
+        cdef float epsilon_float = <float>eps
+        cdef double epsilon_double = <double>eps
+
+        if query_pts.dtype == np.float32 and self.data_pts.dtype == np.float32:
+            desc_float = np.empty(total_out, dtype=np.float32)
+            desc_data_float = <float *>desc_float.data
+            query_array_float = np.ascontiguousarray(query_pts.ravel(), dtype=np.float32)
+            query_array_data_float = <float *>query_array_float.data
+
+            if self._use_int32_t:
+                with nogil:
+                    compute_descriptors_multiscale_float_int32_t(self._kdtree_float_int32_t, self._data_pts_data_float,
+                        query_array_data_float, <uint32_t>num_qpoints, <uint32_t>num_k_max,
+                        k_scales_data, c_num_scales, dub_float, epsilon_float,
+                        query_mask_data, desc_data_float)
+            else:
+                with nogil:
+                    compute_descriptors_multiscale_float_int64_t(self._kdtree_float_int64_t, self._data_pts_data_float,
+                        query_array_data_float, num_qpoints, num_k_max,
+                        k_scales_data, c_num_scales, dub_float, epsilon_float,
+                        query_mask_data, desc_data_float)
+
+            if multiscale:
+                return desc_float.reshape(num_qpoints, c_num_scales, NUM_DESC)
+            else:
+                return desc_float.reshape(num_qpoints, NUM_DESC)
+        else:
+            desc_double = np.empty(total_out, dtype=np.float64)
+            desc_data_double = <double *>desc_double.data
+            query_array_double = np.ascontiguousarray(query_pts.ravel(), dtype=np.float64)
+            query_array_data_double = <double *>query_array_double.data
+
+            if self._use_int32_t:
+                with nogil:
+                    compute_descriptors_multiscale_double_int32_t(self._kdtree_double_int32_t, self._data_pts_data_double,
+                        query_array_data_double, <uint32_t>num_qpoints, <uint32_t>num_k_max,
+                        k_scales_data, c_num_scales, dub_double, epsilon_double,
+                        query_mask_data, desc_data_double)
+            else:
+                with nogil:
+                    compute_descriptors_multiscale_double_int64_t(self._kdtree_double_int64_t, self._data_pts_data_double,
+                        query_array_data_double, num_qpoints, num_k_max,
+                        k_scales_data, c_num_scales, dub_double, epsilon_double,
+                        query_mask_data, desc_data_double)
+
+            if multiscale:
+                return desc_double.reshape(num_qpoints, c_num_scales, NUM_DESC)
+            else:
+                return desc_double.reshape(num_qpoints, NUM_DESC)
+
+    def statistical_outlier_removal(KDTree self, k=20, std_ratio=2.0):
+        """Statistical Outlier Removal (SOR).
+
+        Removes points whose mean distance to k neighbors exceeds
+        ``global_mean + std_ratio * global_std``.
+        Same algorithm as CloudCompare/Open3D SOR.
+
+        :Parameters:
+        k : int
+            Number of neighbors to consider
+        std_ratio : float
+            Number of standard deviations for threshold
+
+        :Returns:
+        inlier_mask : numpy boolean array
+            True for inlier points, shape (n,)
+        mean_distances : numpy array
+            Mean Euclidean distance to k neighbors, shape (n,)
+        threshold : float
+            Distance threshold used
+        """
+
+        if k < 1:
+            raise ValueError('k must be >= 1')
+        if std_ratio < 0:
+            raise ValueError('std_ratio must be non-negative')
+
+        cdef uint64_t num_points = self.n
+        cdef uint64_t num_k = k
+
+        cdef np.ndarray[float, ndim=1] mean_dists_float
+        cdef np.ndarray[double, ndim=1] mean_dists_double
+        cdef float *mean_dists_data_float
+        cdef double *mean_dists_data_double
+
+        if self.data_pts.dtype == np.float32:
+            mean_dists_float = np.empty(num_points, dtype=np.float32)
+            mean_dists_data_float = <float *>mean_dists_float.data
+
+            if self._use_int32_t:
+                with nogil:
+                    sor_mean_dists_float_int32_t(self._kdtree_float_int32_t, self._data_pts_data_float,
+                        <uint32_t>num_points, <uint32_t>num_k, mean_dists_data_float)
+            else:
+                with nogil:
+                    sor_mean_dists_float_int64_t(self._kdtree_float_int64_t, self._data_pts_data_float,
+                        num_points, num_k, mean_dists_data_float)
+
+            mean_dists = mean_dists_float
+        else:
+            mean_dists_double = np.empty(num_points, dtype=np.float64)
+            mean_dists_data_double = <double *>mean_dists_double.data
+
+            if self._use_int32_t:
+                with nogil:
+                    sor_mean_dists_double_int32_t(self._kdtree_double_int32_t, self._data_pts_data_double,
+                        <uint32_t>num_points, <uint32_t>num_k, mean_dists_data_double)
+            else:
+                with nogil:
+                    sor_mean_dists_double_int64_t(self._kdtree_double_int64_t, self._data_pts_data_double,
+                        num_points, num_k, mean_dists_data_double)
+
+            mean_dists = mean_dists_double
+
+        global_mean = mean_dists.mean()
+        global_std = mean_dists.std()
+        threshold = float(global_mean + std_ratio * global_std)
+        inlier_mask = mean_dists < threshold
+
+        return inlier_mask, mean_dists, threshold
 
     def __dealloc__(KDTree self):
         if self._kdtree_float_int32_t != NULL:

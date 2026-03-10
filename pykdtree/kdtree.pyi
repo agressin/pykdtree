@@ -19,6 +19,33 @@ from typing_extensions import disjoint_base
 from typing import Any
 import numpy as np
 
+
+class DESC:
+    """Named constants for compute_descriptors() feature indices."""
+    EIGENVALUE_1: int
+    EIGENVALUE_2: int
+    EIGENVALUE_3: int
+    NORMAL_X: int
+    NORMAL_Y: int
+    NORMAL_Z: int
+    VERTICALITY: int
+    LINEARITY: int
+    PLANARITY: int
+    SPHERICITY: int
+    OMNIVARIANCE: int
+    ANISOTROPY: int
+    EIGENENTROPY: int
+    SURFACE_VARIATION: int
+    Z_RANGE: int
+    Z_ABOVE: int
+    Z_BELOW: int
+    Z_STD: int
+    DENSITY: int
+    ROUGHNESS: int
+    COUNT: int
+    NAMES: list[str]
+
+
 @disjoint_base
 class KDTree:
     """kd-tree for fast nearest-neighbour lookup.
@@ -85,6 +112,72 @@ class KDTree:
             invalid pixel. Mask should have shape (n,) to match data points.
             By default all points are considered valid.
 
+        """
+        ...
+
+    def compute_descriptors(
+        self,
+        query_pts: np.ndarray,
+        k: int | list[int] = 20,
+        eps: float = 0,
+        distance_upper_bound: float | None = None,
+        mask: np.ndarray | None = None,
+    ):
+        """Compute comprehensive point descriptors for 3D query points.
+
+        Computes 20 features per point per scale in a single k-NN pass.
+        Use DESC.* constants for indexing (e.g. desc[:, DESC.LINEARITY]).
+
+        Features:
+          0-2: eigenvalues, 3-5: normal, 6: verticality,
+          7: linearity, 8: planarity, 9: sphericity,
+          10: omnivariance, 11: anisotropy, 12: eigenentropy,
+          13: surface_variation, 14: z_range, 15: z_above,
+          16: z_below, 17: z_std, 18: density, 19: roughness
+
+        Supports multi-scale: pass k as a list (e.g. [5, 10, 20]).
+
+        :Parameters:
+        query_pts : numpy array
+            Query points with shape (m, 3)
+        k : int or list of ints
+            Number of nearest neighbours. If a list, multi-scale.
+        eps : non-negative float
+            Return approximate nearest neighbours
+        distance_upper_bound : non-negative float, optional
+            Return only neighbors within this distance
+        mask : numpy array, optional
+            Boolean mask for invalid data points, shape (n,)
+
+        :Returns:
+        descriptors : numpy array
+            Shape (m, 20) if k is int, (m, num_scales, 20) if k is list.
+        """
+        ...
+
+    def statistical_outlier_removal(
+        self,
+        k: int = 20,
+        std_ratio: float = 2.0,
+    ):
+        """Statistical Outlier Removal (SOR).
+
+        Removes points whose mean distance to k neighbors exceeds
+        ``global_mean + std_ratio * global_std``.
+
+        :Parameters:
+        k : int
+            Number of neighbors to consider
+        std_ratio : float
+            Number of standard deviations for threshold
+
+        :Returns:
+        inlier_mask : numpy boolean array
+            True for inlier points, shape (n,)
+        mean_distances : numpy array
+            Mean Euclidean distance to k neighbors, shape (n,)
+        threshold : float
+            Distance threshold used
         """
         ...
 

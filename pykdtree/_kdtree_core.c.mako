@@ -27,6 +27,13 @@ Anne M. Archibald and libANN by David M. Mount and Sunil Arya.
 #include <stdlib.h>
 #include <stdint.h>
 #include <float.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define NUM_DESCRIPTORS 20
 
 #define PA(i,d)			(pa[no_dims * pidx[i] + d])
 % for ITYPE in ['int32_t', 'int64_t']:
@@ -73,6 +80,9 @@ typedef struct
 ${DTYPE} calc_dist_${DTYPE}(${DTYPE} *point1_coord, ${DTYPE} *point2_coord, int8_t no_dims);
 ${DTYPE} get_cube_offset_${DTYPE}(int8_t dim, ${DTYPE} *point_coord, ${DTYPE} *bbox);
 ${DTYPE} get_min_dist_${DTYPE}(${DTYPE} *point_coord, int8_t no_dims, ${DTYPE} *bbox);
+void eigen_symmetric_3x3_${DTYPE}(${DTYPE} cov_xx, ${DTYPE} cov_xy, ${DTYPE} cov_xz,
+                                   ${DTYPE} cov_yy, ${DTYPE} cov_yz, ${DTYPE} cov_zz,
+                                   ${DTYPE} *evals, ${DTYPE} *normal);
 
 % for ITYPE in ['int32_t', 'int64_t']:
 
@@ -95,6 +105,13 @@ void search_splitnode_${DTYPE}_${ITYPE}(Node_${DTYPE}_${ITYPE} *root, ${DTYPE} *
 void search_tree_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa, ${DTYPE} *point_coords,
                  u${ITYPE} num_points, u${ITYPE} k,  ${DTYPE} distance_upper_bound,
                  ${DTYPE} eps, uint8_t *mask, u${ITYPE} *closest_idxs, ${DTYPE} *closest_dists);
+void sor_mean_dists_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa,
+                 u${ITYPE} num_points, u${ITYPE} k, ${DTYPE} *mean_dists_out);
+void compute_descriptors_multiscale_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa, ${DTYPE} *point_coords,
+                 u${ITYPE} num_points, u${ITYPE} k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 ${DTYPE} distance_upper_bound, ${DTYPE} eps, uint8_t *mask,
+                 ${DTYPE} *descriptors_out);
 
 % endfor
 % endfor
@@ -167,6 +184,114 @@ ${DTYPE} get_min_dist_${DTYPE}(${DTYPE} *point_coord, int8_t no_dims, ${DTYPE} *
     }
 
     return cube_offset;
+}
+
+/************************************************
+Eigendecomposition of 3x3 symmetric matrix using Cardano's formula.
+Eigenvalues returned sorted: evals[0] >= evals[1] >= evals[2].
+Normal is the eigenvector of the smallest eigenvalue.
+Params:
+    cov_xx..cov_zz : upper triangle of symmetric matrix
+    evals : eigenvalues output (3 values)
+    normal : eigenvector of smallest eigenvalue (3 values)
+************************************************/
+void eigen_symmetric_3x3_${DTYPE}(${DTYPE} cov_xx, ${DTYPE} cov_xy, ${DTYPE} cov_xz,
+                                   ${DTYPE} cov_yy, ${DTYPE} cov_yz, ${DTYPE} cov_zz,
+                                   ${DTYPE} *evals, ${DTYPE} *normal)
+{
+    ${DTYPE} e1, e2, e3;
+    ${DTYPE} p1 = cov_xy * cov_xy + cov_xz * cov_xz + cov_yz * cov_yz;
+    ${DTYPE} q = (cov_xx + cov_yy + cov_zz) / 3;
+    ${DTYPE} p2 = (cov_xx - q) * (cov_xx - q) + (cov_yy - q) * (cov_yy - q) +
+                  (cov_zz - q) * (cov_zz - q) + 2 * p1;
+    ${DTYPE} p = sqrt(p2 / 6);
+
+    if (p < (${DTYPE})1e-30)
+    {
+        /* All eigenvalues are equal */
+        e1 = e2 = e3 = q;
+    }
+    else
+    {
+        ${DTYPE} inv_p = 1 / p;
+        /* B = (1/p)(M - q*I) */
+        ${DTYPE} b00 = inv_p * (cov_xx - q);
+        ${DTYPE} b01 = inv_p * cov_xy;
+        ${DTYPE} b02 = inv_p * cov_xz;
+        ${DTYPE} b11 = inv_p * (cov_yy - q);
+        ${DTYPE} b12 = inv_p * cov_yz;
+        ${DTYPE} b22 = inv_p * (cov_zz - q);
+
+        /* det(B) / 2 */
+        ${DTYPE} r = (b00 * (b11 * b22 - b12 * b12)
+                     - b01 * (b01 * b22 - b12 * b02)
+                     + b02 * (b01 * b12 - b11 * b02)) / 2;
+
+        /* Clamp for numerical stability */
+        if (r <= -1) r = -1;
+        else if (r >= 1) r = 1;
+
+        ${DTYPE} phi = acos(r) / 3;
+
+        e1 = q + 2 * p * cos(phi);
+        e3 = q + 2 * p * cos(phi + 2 * M_PI / 3);
+        e2 = 3 * q - e1 - e3;
+    }
+
+    /* Clamp negative eigenvalues to zero */
+    if (e1 < 0) e1 = 0;
+    if (e2 < 0) e2 = 0;
+    if (e3 < 0) e3 = 0;
+
+    evals[0] = e1;
+    evals[1] = e2;
+    evals[2] = e3;
+
+    /* Compute normal: eigenvector of smallest eigenvalue e3 */
+    /* Form rows of (M - e3*I) */
+    ${DTYPE} r0x = cov_xx - e3, r0y = cov_xy,       r0z = cov_xz;
+    ${DTYPE} r1x = cov_xy,       r1y = cov_yy - e3, r1z = cov_yz;
+    ${DTYPE} r2x = cov_xz,       r2y = cov_yz,       r2z = cov_zz - e3;
+
+    /* Cross products of all row pairs, pick largest */
+    ${DTYPE} nx, ny, nz, len_sq, best_len_sq;
+    ${DTYPE} cx, cy, cz;
+
+    /* r0 x r1 */
+    nx = r0y * r1z - r0z * r1y;
+    ny = r0z * r1x - r0x * r1z;
+    nz = r0x * r1y - r0y * r1x;
+    best_len_sq = nx * nx + ny * ny + nz * nz;
+
+    /* r0 x r2 */
+    cx = r0y * r2z - r0z * r2y;
+    cy = r0z * r2x - r0x * r2z;
+    cz = r0x * r2y - r0y * r2x;
+    len_sq = cx * cx + cy * cy + cz * cz;
+    if (len_sq > best_len_sq) { nx = cx; ny = cy; nz = cz; best_len_sq = len_sq; }
+
+    /* r1 x r2 */
+    cx = r1y * r2z - r1z * r2y;
+    cy = r1z * r2x - r1x * r2z;
+    cz = r1x * r2y - r1y * r2x;
+    len_sq = cx * cx + cy * cy + cz * cz;
+    if (len_sq > best_len_sq) { nx = cx; ny = cy; nz = cz; best_len_sq = len_sq; }
+
+    /* Normalize */
+    if (best_len_sq > (${DTYPE})1e-30)
+    {
+        ${DTYPE} inv_len = 1 / sqrt(best_len_sq);
+        normal[0] = nx * inv_len;
+        normal[1] = ny * inv_len;
+        normal[2] = nz * inv_len;
+    }
+    else
+    {
+        /* Degenerate case */
+        normal[0] = 0;
+        normal[1] = 0;
+        normal[2] = 1;
+    }
 }
 
 % for ITYPE in ['int32_t', 'int64_t']:
@@ -740,6 +865,302 @@ void search_tree_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa, $
             search_splitnode_${DTYPE}_${ITYPE}(root, pa, pidx, no_dims, point_coords + no_dims * i, min_dist,
                              k, distance_upper_bound, eps_fac, mask, &closest_idxs[i * k], &closest_dists[i * k]);
         }
+    }
+}
+
+/************************************************
+Compute mean k-NN Euclidean distances for Statistical Outlier Removal.
+Self-queries data points, skips closest neighbor (self), computes
+mean Euclidean distance to k remaining neighbors.
+Params:
+    tree : Tree struct of kd tree
+    pa : data points (also used as query points)
+    num_points : number of data points
+    k : number of neighbors (excluding self)
+    mean_dists_out : mean distances output, shape (num_points,)
+************************************************/
+void sor_mean_dists_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa,
+                 u${ITYPE} num_points, u${ITYPE} k, ${DTYPE} *mean_dists_out)
+{
+    int8_t no_dims = tree->no_dims;
+    ${DTYPE} *bbox = tree->bbox;
+    u${ITYPE} *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    u${ITYPE} k_total = k + 1;  /* +1 to include self */
+    int64_t local_k_total = (int64_t) k_total;
+    Node_${DTYPE}_${ITYPE} *root = (Node_${DTYPE}_${ITYPE} *)tree->root;
+
+    #pragma omp parallel
+    {
+        u${ITYPE} *local_idx = (u${ITYPE} *)malloc(k_total * sizeof(u${ITYPE}));
+        ${DTYPE} *local_dist = (${DTYPE} *)malloc(k_total * sizeof(${DTYPE}));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            ${DTYPE} min_dist, sum;
+            int64_t count;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_total; j++)
+            {
+                local_idx[j] = IDX_MAX_${ITYPE};
+                local_dist[j] = DIST_MAX_${DTYPE};
+            }
+
+            /* Query k+1 neighbors (includes self) */
+            min_dist = get_min_dist_${DTYPE}(pa + no_dims * i, no_dims, bbox);
+            search_splitnode_${DTYPE}_${ITYPE}(root, pa, pidx, no_dims,
+                             pa + no_dims * i, min_dist,
+                             k_total, DIST_MAX_${DTYPE}, (${DTYPE})1.0, NULL,
+                             local_idx, local_dist);
+
+            /* Mean Euclidean distance, skipping closest (self, index 0) */
+            sum = 0;
+            count = 0;
+            for (j = 1; j < local_k_total; j++)
+            {
+                if (local_dist[j] < DIST_MAX_${DTYPE})
+                {
+                    sum += sqrt(local_dist[j]);
+                    count++;
+                }
+            }
+            mean_dists_out[i] = (count > 0) ? sum / (${DTYPE})count : 0;
+        }
+
+        free(local_idx);
+        free(local_dist);
+    }
+}
+
+/************************************************
+Compute comprehensive point descriptors in a single k-NN pass.
+Outputs NUM_DESCRIPTORS (20) features per point per scale:
+  0-2: eigenvalues (lambda1 >= lambda2 >= lambda3)
+  3-5: normal vector (nx, ny, nz)
+  6:   verticality (1 - |nz|)
+  7:   linearity = (l1 - l2) / l1
+  8:   planarity = (l2 - l3) / l1
+  9:   sphericity = l3 / l1
+  10:  omnivariance = (l1*l2*l3)^(1/3)
+  11:  anisotropy = (l1 - l3) / l1
+  12:  eigenentropy = -sum(li/S * ln(li/S))
+  13:  surface_variation = l3 / (l1+l2+l3)
+  14:  z_range (z_max - z_min of neighbors)
+  15:  z_above (max_z_neighbor - query_z)
+  16:  z_below (query_z - min_z_neighbor)
+  17:  z_std (height standard deviation of neighbors)
+  18:  density (k / bounding_box_volume)
+  19:  roughness (|point-to-plane distance|)
+k_scales must be sorted ascending.
+************************************************/
+void compute_descriptors_multiscale_${DTYPE}_${ITYPE}(Tree_${DTYPE}_${ITYPE} *tree, ${DTYPE} *pa, ${DTYPE} *point_coords,
+                 u${ITYPE} num_points, u${ITYPE} k_max,
+                 int32_t *k_scales, int32_t num_scales,
+                 ${DTYPE} distance_upper_bound, ${DTYPE} eps, uint8_t *mask,
+                 ${DTYPE} *descriptors_out)
+{
+    ${DTYPE} eps_fac = 1 / ((1 + eps) * (1 + eps));
+    int8_t no_dims = tree->no_dims;
+    ${DTYPE} *bbox = tree->bbox;
+    u${ITYPE} *pidx = tree->pidx;
+    int64_t i, j;
+    int64_t local_num_points = (int64_t) num_points;
+    int64_t local_k_max = (int64_t) k_max;
+    Node_${DTYPE}_${ITYPE} *root = (Node_${DTYPE}_${ITYPE} *)tree->root;
+
+    #pragma omp parallel
+    {
+        u${ITYPE} *local_idx = (u${ITYPE} *)malloc(k_max * sizeof(u${ITYPE}));
+        ${DTYPE} *local_dist = (${DTYPE} *)malloc(k_max * sizeof(${DTYPE}));
+
+        #pragma omp for private(i, j) schedule(static, 100) nowait
+        for (i = 0; i < local_num_points; i++)
+        {
+            ${DTYPE} min_dist;
+            int32_t s, scale_idx;
+            ${DTYPE} sum_x, sum_y, sum_z;
+            ${DTYPE} sum_xx, sum_xy, sum_xz, sum_yy, sum_yz, sum_zz;
+            ${DTYPE} bb_min_x, bb_min_y, bb_min_z, bb_max_x, bb_max_y, bb_max_z;
+            ${DTYPE} *pt;
+            ${DTYPE} px, py, pz;
+            ${DTYPE} qx = point_coords[no_dims * i];
+            ${DTYPE} qy = point_coords[no_dims * i + 1];
+            ${DTYPE} qz = point_coords[no_dims * i + 2];
+            int64_t out_base = (int64_t)i * num_scales * NUM_DESCRIPTORS;
+
+            /* Initialize k-NN arrays */
+            for (j = 0; j < local_k_max; j++)
+            {
+                local_idx[j] = IDX_MAX_${ITYPE};
+                local_dist[j] = DIST_MAX_${DTYPE};
+            }
+
+            /* Query k_max neighbors */
+            min_dist = get_min_dist_${DTYPE}(point_coords + no_dims * i, no_dims, bbox);
+            search_splitnode_${DTYPE}_${ITYPE}(root, pa, pidx, no_dims,
+                             point_coords + no_dims * i, min_dist,
+                             k_max, distance_upper_bound, eps_fac, mask,
+                             local_idx, local_dist);
+
+            /* Initialize accumulators */
+            sum_x = sum_y = sum_z = 0;
+            sum_xx = sum_xy = sum_xz = sum_yy = sum_yz = sum_zz = 0;
+            bb_min_x = bb_min_y = bb_min_z = DIST_MAX_${DTYPE};
+            bb_max_x = bb_max_y = bb_max_z = -DIST_MAX_${DTYPE};
+            scale_idx = 0;
+
+            for (j = 0; j < local_k_max && scale_idx < num_scales; j++)
+            {
+                if (local_idx[j] == IDX_MAX_${ITYPE} || local_dist[j] >= DIST_MAX_${DTYPE})
+                    break;
+
+                pt = pa + no_dims * local_idx[j];
+                px = pt[0]; py = pt[1]; pz = pt[2];
+
+                /* Accumulate sums for covariance */
+                sum_x += px; sum_y += py; sum_z += pz;
+                sum_xx += px * px; sum_xy += px * py; sum_xz += px * pz;
+                sum_yy += py * py; sum_yz += py * pz; sum_zz += pz * pz;
+
+                /* Update bounding box */
+                if (px < bb_min_x) bb_min_x = px;
+                if (px > bb_max_x) bb_max_x = px;
+                if (py < bb_min_y) bb_min_y = py;
+                if (py > bb_max_y) bb_max_y = py;
+                if (pz < bb_min_z) bb_min_z = pz;
+                if (pz > bb_max_z) bb_max_z = pz;
+
+                /* At each scale boundary, compute all descriptors */
+                if ((int32_t)(j + 1) == k_scales[scale_idx])
+                {
+                    int64_t out_off = out_base + (int64_t)scale_idx * NUM_DESCRIPTORS;
+                    ${DTYPE} evals[3], normal[3];
+
+                    if (j + 1 < 2)
+                    {
+                        for (s = 0; s < NUM_DESCRIPTORS; s++)
+                            descriptors_out[out_off + s] = 0;
+                        descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+                    }
+                    else
+                    {
+                        ${DTYPE} inv_k = 1 / (${DTYPE})(j + 1);
+                        ${DTYPE} mx = sum_x * inv_k;
+                        ${DTYPE} my = sum_y * inv_k;
+                        ${DTYPE} mz = sum_z * inv_k;
+
+                        ${DTYPE} cov_xx = sum_xx * inv_k - mx * mx;
+                        ${DTYPE} cov_xy = sum_xy * inv_k - mx * my;
+                        ${DTYPE} cov_xz = sum_xz * inv_k - mx * mz;
+                        ${DTYPE} cov_yy = sum_yy * inv_k - my * my;
+                        ${DTYPE} cov_yz = sum_yz * inv_k - my * mz;
+                        ${DTYPE} cov_zz = sum_zz * inv_k - mz * mz;
+
+                        eigen_symmetric_3x3_${DTYPE}(cov_xx, cov_xy, cov_xz,
+                                                     cov_yy, cov_yz, cov_zz,
+                                                     evals, normal);
+
+                        /* 0-2: eigenvalues */
+                        descriptors_out[out_off + 0] = evals[0];
+                        descriptors_out[out_off + 1] = evals[1];
+                        descriptors_out[out_off + 2] = evals[2];
+
+                        /* 3-5: normal */
+                        descriptors_out[out_off + 3] = normal[0];
+                        descriptors_out[out_off + 4] = normal[1];
+                        descriptors_out[out_off + 5] = normal[2];
+
+                        /* 6: verticality = 1 - |nz| */
+                        descriptors_out[out_off + 6] = 1 - (normal[2] >= 0 ? normal[2] : -normal[2]);
+
+                        /* 7-13: derived eigenvalue features */
+                        {
+                            ${DTYPE} sum_eig = evals[0] + evals[1] + evals[2];
+                            ${DTYPE} inv_l1 = evals[0] > (${DTYPE})1e-30 ? 1 / evals[0] : 0;
+                            ${DTYPE} inv_sum = sum_eig > (${DTYPE})1e-30 ? 1 / sum_eig : 0;
+
+                            /* 7: linearity = (l1 - l2) / l1 */
+                            descriptors_out[out_off + 7] = (evals[0] - evals[1]) * inv_l1;
+
+                            /* 8: planarity = (l2 - l3) / l1 */
+                            descriptors_out[out_off + 8] = (evals[1] - evals[2]) * inv_l1;
+
+                            /* 9: sphericity = l3 / l1 */
+                            descriptors_out[out_off + 9] = evals[2] * inv_l1;
+
+                            /* 10: omnivariance = (l1 * l2 * l3)^(1/3) */
+                            {
+                                ${DTYPE} prod = evals[0] * evals[1] * evals[2];
+                                descriptors_out[out_off + 10] = prod > 0 ? cbrt(prod) : 0;
+                            }
+
+                            /* 11: anisotropy = (l1 - l3) / l1 */
+                            descriptors_out[out_off + 11] = (evals[0] - evals[2]) * inv_l1;
+
+                            /* 12: eigenentropy = -sum(li/S * ln(li/S)) */
+                            {
+                                ${DTYPE} entropy = 0;
+                                if (sum_eig > (${DTYPE})1e-30)
+                                {
+                                    int32_t ei;
+                                    for (ei = 0; ei < 3; ei++)
+                                    {
+                                        ${DTYPE} p = evals[ei] * inv_sum;
+                                        if (p > (${DTYPE})1e-30)
+                                            entropy -= p * log(p);
+                                    }
+                                }
+                                descriptors_out[out_off + 12] = entropy;
+                            }
+
+                            /* 13: surface_variation = l3 / (l1 + l2 + l3) */
+                            descriptors_out[out_off + 13] = evals[2] * inv_sum;
+                        }
+
+                        /* 14: z_range */
+                        descriptors_out[out_off + 14] = bb_max_z - bb_min_z;
+
+                        /* 15: z_above = max_z - query_z */
+                        descriptors_out[out_off + 15] = bb_max_z - qz;
+
+                        /* 16: z_below = query_z - min_z */
+                        descriptors_out[out_off + 16] = qz - bb_min_z;
+
+                        /* 17: z_std = sqrt(cov_zz) */
+                        descriptors_out[out_off + 17] = cov_zz > 0 ? sqrt(cov_zz) : 0;
+
+                        /* 18: density = k / bbox_volume */
+                        {
+                            ${DTYPE} vol = (bb_max_x - bb_min_x) * (bb_max_y - bb_min_y) * (bb_max_z - bb_min_z);
+                            descriptors_out[out_off + 18] = vol > (${DTYPE})1e-30 ? (${DTYPE})(j + 1) / vol : 0;
+                        }
+
+                        /* 19: roughness = |dot(query - centroid, normal)| */
+                        {
+                            ${DTYPE} dot = (qx - mx) * normal[0] + (qy - my) * normal[1] + (qz - mz) * normal[2];
+                            descriptors_out[out_off + 19] = dot >= 0 ? dot : -dot;
+                        }
+                    }
+                    scale_idx++;
+                }
+            }
+
+            /* Fill remaining scales with zeros */
+            for (s = scale_idx; s < num_scales; s++)
+            {
+                int64_t out_off = out_base + (int64_t)s * NUM_DESCRIPTORS;
+                int32_t f;
+                for (f = 0; f < NUM_DESCRIPTORS; f++)
+                    descriptors_out[out_off + f] = 0;
+                descriptors_out[out_off + 5] = 1;  /* nz = 1 */
+            }
+        }
+
+        free(local_idx);
+        free(local_dist);
     }
 }
 % endfor
